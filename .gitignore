@@ -1,0 +1,139 @@
+############################
+# OS / Editor
+############################
+.DS_Store
+Thumbs.db
+ehthumbs.db
+*.swp
+*.swo
+*.tmp
+*.bak
+*.log
+
+############################
+# IDE
+############################
+.vscode/
+.idea/
+*.iml
+
+############################
+# Python / Flask
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+.pytype/
+.cache/
+.env
+.venv/
+venv/
+ENV/
+env/
+*.env
+*.local
+
+# Flask instance / secrets
+instance/
+flask_session/
+*.pem
+*.key
+
+############################
+# Jupyter
+############################
+.ipynb_checkpoints/
+
+############################
+# Node / Vue
+############################
+node_modules/
+dist/
+dist-ssr/
+.cache/
+.parcel-cache/
+.vite/
+.nuxt/
+.output/
+.vscode-test/
+
+# Vue env files
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+############################
+# SQLite / DB
+############################
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-journal
+*.wal
+*.shm
+
+############################
+# PyTorch / ML artifacts
+############################
+# checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# common output dirs
+runs/
+logs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+checkpoints/
+outputs/
+results/
+
+# data (按需开启：如果你不想忽略数据就删掉这些)
+data/
+datasets/
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+############################
+# Uploads / Generated files
+############################
+uploads/
+static/uploads/
+media/
+tmp/
+temp/
+
+############################
+# Packaging / lock (按需)
+############################
+# 如果你希望提交 lock 文件，请删掉对应行
+# poetry.lock
+# Pipfile.lock
+# uv.lock

@@ -10,8 +10,19 @@ from config import DATABASE_PATH
 
 def get_db():
     """获取数据库连接"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    # conn = sqlite3.connect(DATABASE_PATH) # 原来是这样的吧
+    conn = sqlite3.connect(
+        DATABASE_PATH,
+        timeout=30.0,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
+    # 提升健壮性与并发能力
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.execute('PRAGMA cache_size=-10000')
+    conn.execute('PRAGMA busy_timeout=30000')
     return conn
 
 def init_db():

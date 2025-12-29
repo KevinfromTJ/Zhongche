@@ -1,0 +1,847 @@
+"""
+视频数据管理模块
+用于管理视频、帧提取、OCR和分类结果
+"""
+import sqlite3
+import json
+import hashlib
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+import os
+import sys
+import time
+import threading
+import atexit
+from contextlib import contextmanager
+
+# 添加父目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import VIDEO_DATABASE_PATH, VIDEO_DB_INIT_SQL_PATH
+
+# 视频数据库路径
+
+
+
+class VideoDatabase:
+    """视频数据库管理类（线程安全，带重试机制）"""
+    
+    def __init__(self, db_path: str = VIDEO_DATABASE_PATH):
+        self.db_path = db_path
+        self._local = threading.local()
+        self.timeout = 30.0  # 数据库锁超时时间（秒）
+        self.max_retries = 3  # 最大重试次数
+        self._atexit_registered = False
+        self._register_atexit()
+        self.init_db()
+    
+    def _register_atexit(self):
+        if getattr(self, '_atexit_registered', False):
+            return
+        try:
+            atexit.register(self.close_conn)
+        finally:
+            self._atexit_registered = True
+    
+    def get_conn(self):
+        """
+        获取线程安全的数据库连接
+        使用WAL模式提高并发性能
+        """
+        # 已有连接时做健康检查，避免“已关闭但仍被缓存”的情形
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            try:
+                # 轻量健康检查；若连接已关闭会抛出 ProgrammingError
+                self._local.conn.execute('SELECT 1')
+                return self._local.conn
+            except (sqlite3.ProgrammingError,):
+                # 连接对象已失效，清空以便重建
+                self._local.conn = None
+            except sqlite3.OperationalError as e:
+                # 某些平台会以 OperationalError 暴露“连接已关闭/不可用”
+                if 'closed' in str(e).lower():
+                    self._local.conn = None
+                else:
+                    # 其他运行时问题（例如 locked）交由上层重试机制处理
+                    return self._local.conn
+        
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                
+                # 使用回滚日志（DELETE），在当前环境下与FTS5触发器更稳定
+                conn.execute('PRAGMA journal_mode=DELETE')
+                
+                # 设置同步模式为NORMAL（平衡性能和安全性）
+                conn.execute('PRAGMA synchronous=NORMAL')
+                
+                # 强制外键约束，避免孤儿记录
+                conn.execute('PRAGMA foreign_keys=ON')
+                
+                # 增加缓存大小（默认2000页，改为10000页，约40MB）
+                conn.execute('PRAGMA cache_size=-10000')
+                
+                # 设置繁忙超时
+                conn.execute(f'PRAGMA busy_timeout={int(self.timeout * 1000)}')
+                
+                self._local.conn = conn
+            except sqlite3.DatabaseError as e:
+                print(f"❌ 数据库连接错误: {e}")
+                print(f"   尝试修复数据库...")
+                self._repair_database()
+                # 重新连接
+                conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute('PRAGMA journal_mode=DELETE')
+                conn.execute('PRAGMA synchronous=NORMAL')
+                conn.execute('PRAGMA foreign_keys=ON')
+                conn.execute('PRAGMA cache_size=-10000')
+                conn.execute(f'PRAGMA busy_timeout={int(self.timeout * 1000)}')
+                self._local.conn = conn
+                
+        return self._local.conn
+    
+    def close_conn(self):
+        """关闭当前线程的数据库连接"""
+        if hasattr(self._local, 'conn') and self._local.conn:
+            try:
+                self._local.conn.close()
+            except:
+                pass
+            self._local.conn = None
+    
+    @contextmanager
+    def transaction(self):
+        """
+        事务上下文管理器
+        自动处理提交和回滚
+        """
+        conn = self.get_conn()
+        try:
+            conn.execute('BEGIN')
+            yield conn
+            conn.execute('COMMIT')
+        except Exception as e:
+            conn.execute('ROLLBACK')
+            raise e
+    
+    def execute_with_retry(self, func, *args, **kwargs):
+        """
+        带重试机制的数据库操作
+        
+        Args:
+            func: 要执行的函数
+            *args, **kwargs: 函数参数
+            
+        Returns:
+            函数返回值
+        """
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                last_error = e
+                error_msg = str(e).lower()
+                
+                # 数据库被锁定
+                if 'locked' in error_msg:
+                    wait_time = 0.1 * (2 ** attempt)  # 指数退避
+                    print(f"⚠️  数据库被锁定，{wait_time:.1f}秒后重试 (尝试 {attempt + 1}/{self.max_retries})")
+                    time.sleep(wait_time)
+                    self.close_conn()  # 关闭连接重试
+                    continue
+                
+                # 数据库损坏
+                elif 'malformed' in error_msg or 'corrupt' in error_msg:
+                    print(f"❌ 数据库文件损坏，尝试修复...")
+                    self._repair_database()
+                    if attempt < self.max_retries - 1:
+                        time.sleep(0.5)
+                        self.close_conn()
+                        continue
+                
+                # 其他错误
+                else:
+                    raise e
+        
+        # 所有重试都失败
+        raise last_error
+    
+    def _repair_database(self):
+        """
+        尝试修复损坏的数据库
+        """
+        backup_path = f"{self.db_path}.backup_{int(time.time())}"
+        wal_path = f"{self.db_path}-wal"
+        shm_path = f"{self.db_path}-shm"
+        
+        def _cleanup_wal_shm():
+            try:
+                if os.path.exists(wal_path):
+                    os.remove(wal_path)
+                    print(f"   清理WAL: {wal_path}")
+            except Exception as _e:
+                print(f"   清理WAL失败: {wal_path}, {_e}")
+            try:
+                if os.path.exists(shm_path):
+                    os.remove(shm_path)
+                    print(f"   清理SHM: {shm_path}")
+            except Exception as _e:
+                print(f"   清理SHM失败: {shm_path}, {_e}")
+        
+        try:
+            # 关闭当前连接，避免修复过程中文件被占用
+            self.close_conn()
+            
+            # 1. 备份原数据库
+            if os.path.exists(self.db_path):
+                import shutil
+                shutil.copy2(self.db_path, backup_path)
+                print(f"   备份创建: {backup_path}")
+            
+            # 1.1 清理可能残留的 WAL/SHM，避免旧增量日志污染新库
+            _cleanup_wal_shm()
+            
+            # 2. 纯Python方式：导出+重建（优先，不依赖系统命令）
+            try:
+                sql_dump = f"{self.db_path}.sql"
+                # 导出
+                with sqlite3.connect(self.db_path) as src_conn:
+                    src_conn.text_factory = str
+                    with open(sql_dump, 'w', encoding='utf-8') as f:
+                        for line in src_conn.iterdump():
+                            f.write('%s\n' % line)
+                # 删除旧库
+                if os.path.exists(self.db_path):
+                    os.remove(self.db_path)
+                # 重建
+                with sqlite3.connect(self.db_path) as dst_conn:
+                    with open(sql_dump, 'r', encoding='utf-8') as f:
+                        dst_conn.executescript(f.read())
+                os.remove(sql_dump)
+                # 清理边车并设置基础PRAGMA
+                _cleanup_wal_shm()
+                try:
+                    conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
+                    conn.execute('PRAGMA journal_mode=DELETE')
+                    conn.execute('PRAGMA foreign_keys=ON')
+                    conn.close()
+                except Exception:
+                    pass
+                print(f"✅ 数据库已修复")
+                return True
+            except Exception:
+                # 继续走下一步重建
+                pass
+            
+            # 3. Python方式：重建数据库（丢失数据，但保证结构完整）
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+            
+            # 重新初始化
+            self.close_conn()
+            self.init_db()
+            _cleanup_wal_shm()
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
+                conn.execute('PRAGMA journal_mode=DELETE')
+                conn.execute('PRAGMA foreign_keys=ON')
+                conn.close()
+            except Exception as _:
+                pass
+            
+            print(f"⚠️  数据库已重建（数据可能丢失）")
+            print(f"   如需恢复，请使用备份: {backup_path}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 数据库修复失败: {e}")
+            if os.path.exists(backup_path):
+                print(f"   备份文件可用: {backup_path}")
+            return False
+    
+    def init_db(self):
+        """初始化数据库表"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        # 读取并执行 SQL 文件
+        # sql_file = os.path.join(
+        #     # os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        #     # 'Plan', 'videodatamanage.sql'
+        #     '/data/chenjuntao/OtherProj/dataManage/Plan/videodatamanage.sql'
+        # )
+        sql_file = VIDEO_DB_INIT_SQL_PATH
+        
+        if os.path.exists(sql_file):
+            with open(sql_file, 'r', encoding='utf-8') as f:
+                sql_script = f.read()
+                # 执行整个脚本
+                cursor.executescript(sql_script)
+                print(f"✅ 视频数据库初始化完成: {self.db_path}")
+        else:
+            print(f"⚠️  SQL文件不存在: {sql_file}")
+        
+        conn.commit()
+        self.close_conn()
+    
+    # ==================== 视频操作 ====================
+    
+    def add_video(self, path: str, filename: str = None, **kwargs) -> int:
+        """
+        添加视频记录（带重试机制）
+        
+        Args:
+            path: 视频文件路径
+            filename: 视频文件名
+            **kwargs: 其他字段（train_no, route_section, start_time等）
+        
+        Returns:
+            video_id: 视频ID
+        """
+        def _add():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            if filename is None:
+                filename_val = os.path.basename(path)
+            else:
+                filename_val = filename
+            
+            # 计算文件SHA1（如果文件存在）
+            sha1 = None
+            if os.path.exists(path):
+                sha1 = self._calculate_sha1(path)
+            
+            # 检查是否已存在
+            cursor.execute('SELECT id FROM videos WHERE path = ?', (path,))
+            existing = cursor.fetchone()
+            if existing:
+                return existing['id']
+            
+            # 插入视频记录
+            fields = ['path', 'filename', 'sha1']
+            values = [path, filename_val, sha1]
+            
+            # 添加其他字段
+            allowed_fields = [
+                'train_no', 'route_section', 'start_time', 'end_time', 
+                'fps', 'duration_sec', 'total_frames', 'width', 'height', 
+                'file_size', 'status'
+            ]
+            for field in allowed_fields:
+                if field in kwargs:
+                    fields.append(field)
+                    values.append(kwargs[field])
+            
+            placeholders = ','.join(['?'] * len(values))
+            field_names = ','.join(fields)
+            
+            cursor.execute(
+                f'INSERT INTO videos ({field_names}) VALUES ({placeholders})',
+                values
+            )
+            video_id = cursor.lastrowid
+            conn.commit()
+            print(f"✅ 添加视频: {filename_val} (ID: {video_id})")
+            return video_id
+        
+        return self.execute_with_retry(_add)
+    
+    def get_video(self, video_id: int) -> Optional[Dict]:
+        """获取视频信息"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM videos WHERE id = ?', (video_id,))
+        row = cursor.fetchone()
+        self.close_conn()
+        return dict(row) if row else None
+    
+    def get_video_by_path(self, path: str) -> Optional[Dict]:
+        """根据路径获取视频"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM videos WHERE path = ?', (path,))
+        row = cursor.fetchone()
+        self.close_conn()
+        return dict(row) if row else None
+    
+    def update_video(self, video_id: int, **kwargs):
+        """更新视频信息"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        fields = []
+        values = []
+        for key, value in kwargs.items():
+            fields.append(f'{key} = ?')
+            values.append(value)
+        
+        if fields:
+            fields.append('updated_at = ?')
+            values.append(datetime.now().isoformat())
+            values.append(video_id)
+            
+            sql = f"UPDATE videos SET {','.join(fields)} WHERE id = ?"
+            cursor.execute(sql, values)
+            conn.commit()
+        
+        self.close_conn()
+    
+    def list_videos(self, status: str = None, train_no: str = None, 
+                   limit: int = None, offset: int = 0) -> List[Dict]:
+        """
+        列出视频
+        
+        Args:
+            status: 过滤状态
+            train_no: 过滤车次号
+            limit: 返回数量限制
+            offset: 偏移量
+        """
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        conditions = []
+        params = []
+        
+        if status:
+            conditions.append('status = ?')
+            params.append(status)
+        
+        if train_no:
+            conditions.append('train_no = ?')
+            params.append(train_no)
+        
+        where_clause = ' AND '.join(conditions) if conditions else '1=1'
+        sql = f'SELECT * FROM videos WHERE {where_clause} ORDER BY created_at DESC'
+        
+        if limit:
+            sql += f' LIMIT {limit} OFFSET {offset}'
+        
+        cursor.execute(sql, params)
+        videos = [dict(row) for row in cursor.fetchall()]
+        self.close_conn()
+        return videos
+    
+    def delete_video(self, video_id: int):
+        """删除视频及其所有帧"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM videos WHERE id = ?', (video_id,))
+        # frames表设置了ON DELETE CASCADE，会自动删除
+        conn.commit()
+        self.close_conn()
+    
+    # ==================== 帧操作 ====================
+    
+    def add_frame(self, video_id: int, frame_idx: int, pts_ms: int, 
+                 image_path: str, **kwargs) -> int:
+        """
+        添加帧记录（带重试机制）
+        
+        Args:
+            video_id: 视频ID
+            frame_idx: 帧序号
+            pts_ms: 时间戳（毫秒）
+            image_path: 图片路径
+            **kwargs: OCR和分类结果字段
+        """
+        def _add():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            image_filename = os.path.basename(image_path)
+            fields = ['video_id', 'frame_idx', 'pts_ms', 'image_path', 'image_filename']
+            values = [video_id, frame_idx, pts_ms, image_path, image_filename]
+            
+            # 添加其他字段
+            allowed_fields = [
+                'ocr_text', 'ocr_time', 'ocr_train_no', 'ocr_route_section',
+                'ocr_carriage_no', 'ocr_position_no', 'ocr_speed', 
+                'ocr_mileage', 'ocr_confidence',
+                'label_weather', 'label_weather_score',
+                'label_location', 'label_location_score',
+                'label_time_period', 'label_time_period_score',
+                'label_anomaly', 'label_anomaly_score',
+                'labels_json', 'ai_processed'
+            ]
+            
+            for field in allowed_fields:
+                if field in kwargs:
+                    fields.append(field)
+                    value = kwargs[field]
+                    # JSON字段需要序列化
+                    if field == 'labels_json' and isinstance(value, dict):
+                        value = json.dumps(value)
+                    values.append(value)
+            
+            placeholders = ','.join(['?'] * len(values))
+            field_names = ','.join(fields)
+            
+            cursor.execute(
+                f'INSERT INTO frames ({field_names}) VALUES ({placeholders})',
+                values
+            )
+            frame_id = cursor.lastrowid
+            conn.commit()
+            return frame_id
+        
+        return self.execute_with_retry(_add)
+    
+    def batch_add_frames(self, frames_data: List[Dict]):
+        """批量添加帧记录（带事务）"""
+        def _batch_add():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            cursor.execute('BEGIN')
+            try:
+                for frame in frames_data:
+                    video_id = frame['video_id']
+                    frame_idx = frame['frame_idx']
+                    pts_ms = frame['pts_ms']
+                    image_path = frame['image_path']
+                    
+                    # 移除必须字段
+                    kwargs = {k: v for k, v in frame.items() 
+                             if k not in ['video_id', 'frame_idx', 'pts_ms', 'image_path']}
+                    
+                    # 直接插入，不使用递归调用
+                    image_filename = os.path.basename(image_path)
+                    fields = ['video_id', 'frame_idx', 'pts_ms', 'image_path', 'image_filename']
+                    values = [video_id, frame_idx, pts_ms, image_path, image_filename]
+                    
+                    for k, v in kwargs.items():
+                        fields.append(k)
+                        if k == 'labels_json' and isinstance(v, dict):
+                            v = json.dumps(v)
+                        values.append(v)
+                    
+                    placeholders = ','.join(['?'] * len(values))
+                    field_names = ','.join(fields)
+                    
+                    cursor.execute(
+                        f'INSERT INTO frames ({field_names}) VALUES ({placeholders})',
+                        values
+                    )
+                
+                cursor.execute('COMMIT')
+                print(f"✅ 批量添加 {len(frames_data)} 帧")
+                return True
+                
+            except Exception as e:
+                cursor.execute('ROLLBACK')
+                raise e
+        
+        return self.execute_with_retry(_batch_add)
+    
+    def get_frame(self, frame_id: int) -> Optional[Dict]:
+        """获取帧信息"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM frames WHERE id = ?', (frame_id,))
+        row = cursor.fetchone()
+        self.close_conn()
+        return dict(row) if row else None
+    
+    def update_frame_ai_results(self, frame_id: int, ocr_results: Dict = None, 
+                                classification_results: Dict = None):
+        """
+        更新帧的AI处理结果（带重试机制）
+        
+        Args:
+            frame_id: 帧ID
+            ocr_results: OCR结果字典
+            classification_results: 分类结果字典
+        """
+        def _update():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            fields = []
+            values = []
+            updated_ocr_text = None
+            
+            if ocr_results:
+                for key, value in ocr_results.items():
+                    if key.startswith('ocr_'):
+                        fields.append(f'{key} = ?')
+                        values.append(value)
+                        if key == 'ocr_text':
+                            updated_ocr_text = value if value is not None else ''
+            
+            if classification_results:
+                for key, value in classification_results.items():
+                    if key.startswith('label_'):
+                        fields.append(f'{key} = ?')
+                        values.append(value)
+                
+                # 保存完整的分类结果JSON
+                if 'labels_json' in classification_results:
+                    fields.append('labels_json = ?')
+                    values.append(json.dumps(classification_results['labels_json']))
+            
+            if fields:
+                fields.append('ai_processed = 1')
+                # fields.append('ai_processed_at = ?')
+                fields.append('updated_at = ?')
+                now = datetime.now().isoformat()
+                values.append(now)
+                values.append(frame_id)
+                
+                sql = f"UPDATE frames SET {','.join(fields)} WHERE id = ?"
+                cursor.execute(sql, values)
+                conn.commit()
+            
+            return True
+        
+        return self.execute_with_retry(_update)
+    
+    def list_frames(self, video_id: int = None, ai_processed: bool = None,
+                   limit: int = None, offset: int = 0) -> List[Dict]:
+        """列出帧记录"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        conditions = []
+        params = []
+        
+        if video_id is not None:
+            conditions.append('video_id = ?')
+            params.append(video_id)
+        
+        if ai_processed is not None:
+            conditions.append('ai_processed = ?')
+            params.append(1 if ai_processed else 0)
+        
+        where_clause = ' AND '.join(conditions) if conditions else '1=1'
+        sql = f'SELECT * FROM frames WHERE {where_clause} ORDER BY video_id, frame_idx'
+        
+        if limit:
+            sql += f' LIMIT {limit} OFFSET {offset}'
+        
+        cursor.execute(sql, params)
+        frames = [dict(row) for row in cursor.fetchall()]
+        self.close_conn()
+        return frames
+    
+    # ==================== 高级查询 ====================
+    
+    def query_frames(self, 
+                    start_time: str = None,
+                    end_time: str = None,
+                    train_no: str = None,
+                    route_section: str = None,
+                    weather: str = None,
+                    location: str = None,
+                    time_period: str = None,
+                    min_speed: float = None,
+                    max_speed: float = None,
+                    limit: int = 100,
+                    offset: int = 0) -> List[Dict]:
+        """
+        高级帧查询
+        
+        Args:
+            start_time: 开始时间（ISO格式）
+            end_time: 结束时间（ISO格式）
+            train_no: 车次号
+            route_section: 区间
+            weather: 天气标签
+            location: 位置标签
+            time_period: 时段标签
+            min_speed: 最小速度
+            max_speed: 最大速度
+            limit: 返回数量
+            offset: 偏移量
+        """
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        conditions = []
+        params = []
+        
+        if start_time:
+            conditions.append('ocr_time >= ?')
+            params.append(start_time)
+        
+        if end_time:
+            conditions.append('ocr_time <= ?')
+            params.append(end_time)
+        
+        if train_no:
+            conditions.append('ocr_train_no = ?')
+            params.append(train_no)
+        
+        if route_section:
+            conditions.append('ocr_route_section LIKE ?')
+            params.append(f'%{route_section}%')
+        
+        if weather:
+            conditions.append('label_weather = ?')
+            params.append(weather)
+        
+        if location:
+            conditions.append('label_location = ?')
+            params.append(location)
+        
+        if time_period:
+            conditions.append('label_time_period = ?')
+            params.append(time_period)
+        
+        if min_speed is not None:
+            conditions.append('ocr_speed >= ?')
+            params.append(min_speed)
+        
+        if max_speed is not None:
+            conditions.append('ocr_speed <= ?')
+            params.append(max_speed)
+        
+        where_clause = ' AND '.join(conditions) if conditions else '1=1'
+        sql = f'''
+            SELECT * FROM frames 
+            WHERE {where_clause} 
+            ORDER BY ocr_time, frame_idx
+            LIMIT {limit} OFFSET {offset}
+        '''
+        
+        cursor.execute(sql, params)
+        frames = [dict(row) for row in cursor.fetchall()]
+        self.close_conn()
+        return frames
+    
+    def search_ocr_text(self, keyword: str, limit: int = 100) -> List[Dict]:
+        """
+        基于OCR文本的简单包含搜索（LIKE）
+        
+        Args:
+            keyword: 搜索关键词
+            limit: 返回数量
+        """
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        like = f'%{keyword}%'
+        cursor.execute('SELECT * FROM frames WHERE ocr_text LIKE ? LIMIT ?', (like, limit))
+        frames = [dict(row) for row in cursor.fetchall()]
+        self.close_conn()
+        return frames
+    
+    def get_statistics(self) -> Dict:
+        """获取统计信息"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        # 视频统计
+        cursor.execute('SELECT COUNT(*) as total FROM videos')
+        total_videos = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT COUNT(*) as total FROM videos WHERE status = "extracted"')
+        extracted_videos = cursor.fetchone()['total']
+        
+        # 帧统计
+        cursor.execute('SELECT COUNT(*) as total FROM frames')
+        total_frames = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT COUNT(*) as total FROM frames WHERE ai_processed = 1')
+        processed_frames = cursor.fetchone()['total']
+        
+        # 标签分布
+        cursor.execute('''
+            SELECT label_weather, COUNT(*) as count 
+            FROM frames 
+            WHERE label_weather IS NOT NULL 
+            GROUP BY label_weather
+        ''')
+        weather_dist = {row['label_weather']: row['count'] for row in cursor.fetchall()}
+        
+        cursor.execute('''
+            SELECT label_location, COUNT(*) as count 
+            FROM frames 
+            WHERE label_location IS NOT NULL 
+            GROUP BY label_location
+        ''')
+        location_dist = {row['label_location']: row['count'] for row in cursor.fetchall()}
+        
+        self.close_conn()
+        
+        return {
+            'total_videos': total_videos,
+            'extracted_videos': extracted_videos,
+            'total_frames': total_frames,
+            'processed_frames': processed_frames,
+            'weather_distribution': weather_dist,
+            'location_distribution': location_dist
+        }
+    
+    # ==================== 工具方法 ====================
+    
+    def _calculate_sha1(self, filepath: str) -> str:
+        """计算文件SHA1"""
+        sha1 = hashlib.sha1()
+        with open(filepath, 'rb') as f:
+            while True:
+                data = f.read(65536)
+                if not data:
+                    break
+                sha1.update(data)
+        return sha1.hexdigest()
+    
+    def log_processing(self, video_id: int, operation: str, 
+                      status: str, details: Dict = None, 
+                      error_msg: str = None, duration_sec: float = None):
+        """记录处理日志（带重试机制）"""
+        def _log():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO processing_logs 
+                (video_id, operation, status, details, error_msg, 
+                 started_at, completed_at, duration_sec)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                video_id, operation, status,
+                json.dumps(details) if details else None,
+                error_msg,
+                datetime.now().isoformat(),
+                datetime.now().isoformat(),
+                duration_sec
+            ))
+            conn.commit()
+            return True
+        
+        try:
+            return self.execute_with_retry(_log)
+        except Exception as e:
+            # 日志记录失败不应该影响主流程
+            print(f"⚠️  日志记录失败: {e}")
+            return False
+
+
+# 全局实例
+video_db = VideoDatabase()
+
+
+if __name__ == '__main__':
+    # 测试
+    db = VideoDatabase()
+    print("✅ 视频数据库初始化成功")
+    
+    # 测试添加视频
+    video_id = db.add_video(
+        path='/test/video.mp4',
+        filename='video.mp4',
+        train_no='G4926',
+        route_section='佛山西-宜宾',
+        fps=30.0,
+        duration_sec=120.5,
+        status='pending'
+    )
+    print(f"✅ 添加测试视频 ID: {video_id}")
+    
+    # 获取统计信息
+    stats = db.get_statistics()
+    print(f"📊 统计信息: {stats}")

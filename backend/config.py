@@ -13,6 +13,8 @@ for dir_path in [DATA_DIR, DATASETS_DIR, ANNOTATIONS_DIR, CHECKPOINTS_DIR]:
 
 # 数据库配置
 DATABASE_PATH = os.path.join(DATA_DIR, 'easydata.db')
+VIDEO_DATABASE_PATH = os.path.join(DATA_DIR, 'video_data.db')
+VIDEO_DB_INIT_SQL_PATH = os.path.join(BASE_DIR, 'sql', 'videodatamanage.sql')
 
 # Flask配置
 class Config:
@@ -40,7 +42,7 @@ CLASSIFIER_CLASS_NAMES = [
 
 # 服务器配置
 HOST = '0.0.0.0'
-PORT = 6006
+PORT = 6008
 
 # 智能标注模型目录配置
 CLASSIFICATION_MODELS_DIR = os.path.join(BASE_DIR, 'ai_models', 'classification')

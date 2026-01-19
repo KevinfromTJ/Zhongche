@@ -38,16 +38,22 @@ class VideoOCRService:
         # 模拟OCR处理时间
         # time.sleep(0.01)
         
-        # 随机选择车次和区间
-        train_no = random.choice(self.train_numbers)
-        route_section = random.choice(self.route_sections)
+        # 基于帧序号的可重复“标记帧”规则，便于测试检索与验证
+        is_target = (frame_idx % 300 == 0)
+        if is_target:
+            train_no = 'G-TARGET'
+            route_section = 'TARGET-SECTION'
+        else:
+            # 随机选择车次和区间
+            train_no = random.choice(self.train_numbers)
+            route_section = random.choice(self.route_sections)
         
         # 模拟车厢号和位置号
-        car_no = random.randint(1, 16)
-        pos_no = random.randint(1, 10)
+        car_no = 9 if is_target else random.randint(1, 16)
+        pos_no = 9 if is_target else random.randint(1, 10)
         
         # 模拟速度（在基准速度附近波动）
-        speed = self.base_speed + random.uniform(-30, 30)
+        speed = 250 if is_target else (self.base_speed + random.uniform(-30, 30))
         speed = max(0, min(350, speed))  # 限制在0-350之间
         
         # 模拟里程（随帧序号递增）
@@ -59,13 +65,14 @@ class VideoOCRService:
         ocr_time_iso = ocr_time.isoformat()
         
         # 构造OCR文本（模拟图片中的格式）
+        marker = "[TARGET]" if is_target else ""
         ocr_text = f"""里程:Z{int(mileage)}
 区间:{route_section}
 速度:{int(speed)}
 车次:C{train_no}
 车厢号:{car_no}
 位置号:{pos_no}
-{ocr_time_str}"""
+{ocr_time_str} {marker}"""
         
         # OCR置信度（模拟）
         confidence = random.uniform(0.85, 0.98)

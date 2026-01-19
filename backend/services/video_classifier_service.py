@@ -34,37 +34,49 @@ class VideoClassifierService:
         Returns:
             分类结果字典
         """
-        # 天气分类
-        weather = random.choices(
-            self.weather_labels, 
-            weights=self.weather_weights, 
-            k=1
-        )[0]
-        weather_score = random.uniform(0.75, 0.98)
-        
-        # 位置分类
-        location = random.choices(
-            self.location_labels, 
-            weights=self.location_weights, 
-            k=1
-        )[0]
-        location_score = random.uniform(0.70, 0.95)
-        
-        # 时段分类
-        time_period = random.choices(
-            self.time_period_labels, 
-            weights=self.time_period_weights, 
-            k=1
-        )[0]
-        time_period_score = random.uniform(0.80, 0.99)
-        
-        # 异常检测
-        anomaly = random.choices(
-            self.anomaly_labels, 
-            weights=self.anomaly_weights, 
-            k=1
-        )[0]
-        anomaly_score = random.uniform(0.90, 0.99) if anomaly == '正常' else random.uniform(0.60, 0.85)
+        # 标记帧：与 OCR 保持一致（frame_idx % 300 == 0）
+        is_target = (frame_idx % 300 == 0)
+        if is_target:
+            weather = '晴天'
+            location = '隧道内'
+            time_period = '白天'
+            anomaly = '正常'
+            weather_score = 0.95
+            location_score = 0.95
+            time_period_score = 0.98
+            anomaly_score = 0.98
+        else:
+            # 天气分类
+            weather = random.choices(
+                self.weather_labels, 
+                weights=self.weather_weights, 
+                k=1
+            )[0]
+            weather_score = random.uniform(0.75, 0.98)
+            
+            # 位置分类
+            location = random.choices(
+                self.location_labels, 
+                weights=self.location_weights, 
+                k=1
+            )[0]
+            location_score = random.uniform(0.70, 0.95)
+            
+            # 时段分类
+            time_period = random.choices(
+                self.time_period_labels, 
+                weights=self.time_period_weights, 
+                k=1
+            )[0]
+            time_period_score = random.uniform(0.80, 0.99)
+            
+            # 异常检测
+            anomaly = random.choices(
+                self.anomaly_labels, 
+                weights=self.anomaly_weights, 
+                k=1
+            )[0]
+            anomaly_score = random.uniform(0.90, 0.99) if anomaly == '正常' else random.uniform(0.60, 0.85)
         
         # 构造完整的标签JSON（包含所有分类器的结果）
         labels_json = {

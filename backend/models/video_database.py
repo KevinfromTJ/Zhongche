@@ -285,7 +285,49 @@ class VideoDatabase:
             print(f"⚠️  SQL文件不存在: {sql_file}")
         
         conn.commit()
+        # 迁移：补充新列（若缺失）
+        self._apply_migrations()
         self.close_conn()
+    
+    def _apply_migrations(self):
+        """按需添加新列（幂等）"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        try:
+            # videos 表新增：v_stream_index, v_time_base_num, v_time_base_den
+            cursor.execute("PRAGMA table_info(videos)")
+            cols = [row["name"] for row in cursor.fetchall()]
+            if "v_stream_index" not in cols:
+                try:
+                    cursor.execute("ALTER TABLE videos ADD COLUMN v_stream_index INTEGER")
+                except Exception:
+                    pass
+            if "v_time_base_num" not in cols:
+                try:
+                    cursor.execute("ALTER TABLE videos ADD COLUMN v_time_base_num INTEGER")
+                except Exception:
+                    pass
+            if "v_time_base_den" not in cols:
+                try:
+                    cursor.execute("ALTER TABLE videos ADD COLUMN v_time_base_den INTEGER")
+                except Exception:
+                    pass
+
+            # frames 表新增：frame_pts
+            cursor.execute("PRAGMA table_info(frames)")
+            fcols = [row["name"] for row in cursor.fetchall()]
+            if "frame_pts" not in fcols:
+                try:
+                    cursor.execute("ALTER TABLE frames ADD COLUMN frame_pts INTEGER")
+                except Exception:
+                    pass
+
+            conn.commit()
+            print("✅ 数据库迁移检查完成")
+        except Exception as e:
+            print(f"⚠️  数据库迁移检查失败: {e}")
+        finally:
+            self.close_conn()
     
     # ==================== 视频操作 ====================
     
@@ -329,7 +371,8 @@ class VideoDatabase:
             allowed_fields = [
                 'train_no', 'route_section', 'start_time', 'end_time', 
                 'fps', 'duration_sec', 'total_frames', 'width', 'height', 
-                'file_size', 'status'
+                'file_size', 'status',
+                'v_stream_index', 'v_time_base_num', 'v_time_base_den'
             ]
             for field in allowed_fields:
                 if field in kwargs:
@@ -459,6 +502,7 @@ class VideoDatabase:
             
             # 添加其他字段
             allowed_fields = [
+                'frame_pts',
                 'ocr_text', 'ocr_time', 'ocr_train_no', 'ocr_route_section',
                 'ocr_carriage_no', 'ocr_position_no', 'ocr_speed', 
                 'ocr_mileage', 'ocr_confidence',

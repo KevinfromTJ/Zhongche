@@ -42,7 +42,10 @@ CLASSIFIER_CLASS_NAMES = [
 
 # 服务器配置
 HOST = '0.0.0.0'
-PORT = 6008
+PORT = 6009
+
+# 是否在AI处理完成后删除已落地的帧图片（仅保留数据库索引，按需抽帧）
+DELETE_FRAME_IMAGES_AFTER_AI = False
 
 # 智能标注模型目录配置
 CLASSIFICATION_MODELS_DIR = os.path.join(BASE_DIR, 'ai_models', 'classification')

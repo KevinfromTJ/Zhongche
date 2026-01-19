@@ -8,13 +8,15 @@ import sys
 from datetime import datetime
 from werkzeug.utils import secure_filename
 import threading
+import traceback
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.video_database import video_db
 from services.video_frame_extractor import VideoFrameExtractor
 from services.video_ocr_service import video_ocr_service
 from services.video_classifier_service import video_classifier_service
-from config import DATASETS_DIR
+from config import DATASETS_DIR, DELETE_FRAME_IMAGES_AFTER_AI
+from services.frame_accessor import FFmpegAccessor
 
 import traceback
 
@@ -154,7 +156,7 @@ def extract_video_frames(video_id):
     
     JSON参数:
         max_frames: 最大提取帧数（可选）
-        sample_rate: 采样率（可选）
+        sample_rate: 采样率（可选, 如果指定则忽略帧数）
     """
     video = video_db.get_video(video_id)
     
@@ -283,6 +285,29 @@ def _process_video_ai_sync(video_id, batch_size=50):
             duration_sec=duration
         )
         
+        # 可选：删除已落地的帧图片，仅保留数据库索引（按需抽帧）
+        if DELETE_FRAME_IMAGES_AFTER_AI:
+            try:
+                all_frames = video_db.list_frames(video_id=video_id)
+                removed = 0
+                for f in all_frames:
+                    p = f.get('image_path') or ''
+                    if p and os.path.exists(p):
+                        try:
+                            os.remove(p)
+                            removed += 1
+                        except Exception:
+                            pass
+                # 将 image_path 清空，避免前端误用
+                conn = video_db.get_conn()
+                cur = conn.cursor()
+                cur.execute("UPDATE frames SET image_path = '' WHERE video_id = ?", (video_id,))
+                conn.commit()
+                video_db.close_conn()
+                print(f"🧹 已清理帧图片: {removed} 个")
+            except Exception as _e:
+                print(f"⚠️ 清理帧图片失败: {_e}")
+        
         print(f"✅ AI处理完成: {processed_count} 帧，用时 {duration:.2f}s")
         
         return {
@@ -383,6 +408,58 @@ def register_video_path():
             'path': path
         }
     })
+
+
+@video_bp.route('/videos/<int:video_id>/image-at', methods=['GET'])
+def get_video_frame_at(video_id):
+    """
+    按时间点（秒）从视频直接抽取一帧（不依赖 frames 表），支持 seed_video_id 修复原始H264缺SPS/PPS的情况。
+    Query:
+      t: 秒(浮点)，必填
+      quality: 1..95，默认85
+      seed_video_id: 可选，参考视频ID，用于提取SPS/PPS进行修复
+    """
+    video = video_db.get_video(video_id)
+    if not video:
+        return jsonify({'success': False, 'message': '视频不存在'}), 404
+    video_path = video['path']
+    if not os.path.exists(video_path):
+        return jsonify({'success': False, 'message': '视频文件不存在'}), 404
+
+    try:
+        t = float(request.args.get('t'))
+    except Exception:
+        return jsonify({'success': False, 'message': '缺少或非法的参数 t'}), 400
+    quality = max(1, min(95, int(request.args.get('quality', 85))))
+    seed_id = request.args.get('seed_video_id', type=int)
+
+    accessor = FFmpegAccessor()
+    try:
+        data = accessor.extract_frame_bytes_by_sec(
+            video_path=video_path,
+            t_sec=t,
+            quality=quality
+        )
+        return send_file(BytesIO(data), mimetype='image/jpeg')
+    except Exception as e:
+        traceback.print_exc()
+        # 尝试seed修复路径
+        if seed_id:
+            seed = video_db.get_video(seed_id)
+            if seed and os.path.exists(seed['path']):
+                try:
+                    data = accessor.extract_frame_bytes_by_sec_with_seed(
+                        broken_video_path=video_path,
+                        t_sec=t,
+                        seed_video_path=seed['path'],
+                        assumed_fps=25,
+                        quality=quality
+                    )
+                    return send_file(BytesIO(data), mimetype='image/jpeg')
+                except Exception as e2:
+                    traceback.print_exc()
+                    return jsonify({'success': False, 'message': f'抽帧失败(含seed修复): {e2}'}), 500
+        return jsonify({'success': False, 'message': f'抽帧失败: {e}'}), 500
 
 
 @video_bp.route('/videos/statistics', methods=['GET'])

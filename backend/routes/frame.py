@@ -5,9 +5,15 @@
 from flask import Blueprint, request, jsonify, send_file
 import os
 import sys
+from io import BytesIO
+import time
+import zipfile
+from typing import Dict, List
+import traceback
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.video_database import video_db
+from services.frame_accessor import FFmpegAccessor
 
 frame_bp = Blueprint('frame', __name__)
 
@@ -139,21 +145,162 @@ def search_frames():
         'data': frames
     })
 
+@frame_bp.route('/frames/batch-image', methods=['POST'])
+def get_frames_batch_image():
+    """
+    批量按需抽帧，返回 zip：
+    body: { "frame_ids": [1,2,...], "quality": 85 }
+    """
+    data = request.get_json(silent=True) or {}
+    ids = data.get('frame_ids') or []
+    try:
+        ids = [int(x) for x in ids]
+    except Exception:
+        return jsonify({'success': False, 'message': 'frame_ids 需为整数列表'}), 400
+    if not ids:
+        return jsonify({'success': False, 'message': 'frame_ids 为空'}), 400
+    quality = max(1, min(95, int(data.get('quality', 85))))
+
+    frames = []
+    for fid in ids:
+        f = video_db.get_frame(fid)
+        if f:
+            frames.append(f)
+    if not frames:
+        return jsonify({'success': False, 'message': '未找到任何帧'}), 404
+
+    accessor = FFmpegAccessor()
+    # 按视频分组，减少重复探测
+    from collections import defaultdict
+    by_video = defaultdict(list)
+    for f in frames:
+        by_video[f['video_id']].append(f)
+
+    zip_buf = BytesIO()
+    zf = zipfile.ZipFile(zip_buf, mode='w', compression=zipfile.ZIP_STORED)
+
+    for vid, fs in by_video.items():
+        video = video_db.get_video(vid)
+        if not video or not os.path.exists(video['path']):
+            continue
+        video_path = video['path']
+        tb_num = video.get('v_time_base_num')
+        tb_den = video.get('v_time_base_den')
+        if not (tb_num and tb_den):
+            try:
+                tb_num, tb_den, fps = accessor.robust_probe_time_base_and_fps(video_path)
+                video_db.update_video(vid, v_time_base_num=tb_num, v_time_base_den=tb_den)
+            except Exception:
+                traceback.print_exc()
+                continue
+
+        for f in fs:
+            frame_id = f['id']
+            if f.get('image_path') and os.path.exists(f['image_path']):
+                # 已有文件，直接打包
+                with open(f['image_path'], 'rb') as rf:
+                    zf.writestr(f"frame_{frame_id}.jpg", rf.read())
+                continue
+
+            if f.get('frame_pts') is not None:
+                t_sec = f['frame_pts'] * (tb_num / tb_den)
+            elif f.get('pts_ms') is not None:
+                t_sec = f['pts_ms'] / 1000.0
+            else:
+                continue
+
+            try:
+                data = accessor.extract_frame_bytes_by_sec(
+                    video_path=video_path,
+                    t_sec=t_sec,
+                    quality=quality
+                )
+                zf.writestr(f"frame_{frame_id}.jpg", data)
+            except Exception:
+                traceback.print_exc()
+                # 跳过失败
+                continue
+
+    zf.close()
+    zip_buf.seek(0)
+    return send_file(zip_buf, mimetype='application/zip', download_name=f"frames_{int(time.time())}.zip", as_attachment=True)
+
 
 @frame_bp.route('/frames/<int:frame_id>/image', methods=['GET'])
 def get_frame_image(frame_id):
-    """获取帧图片文件"""
+    """
+    获取帧图片：
+    - 如 image_path 存在文件，直接返回；
+    - 否则根据数据库中 frame_pts/pts_ms 与视频 time_base 进行按需抽帧。
+    可选 query: quality=1..95 (默认85)
+    """
     frame = video_db.get_frame(frame_id)
     
     if not frame:
         return jsonify({'success': False, 'message': '帧不存在'}), 404
     
-    image_path = frame['image_path']
+    image_path = frame.get('image_path') or ''
     
-    if not os.path.exists(image_path):
-        return jsonify({'success': False, 'message': '图片文件不存在'}), 404
-    
-    return send_file(image_path, mimetype='image/jpeg')
+    if image_path and os.path.exists(image_path):
+        return send_file(image_path, mimetype='image/jpeg')
+
+    # On-demand extraction
+    video = video_db.get_video(frame['video_id'])
+    if not video:
+        return jsonify({'success': False, 'message': '视频不存在'}), 404
+    video_path = video['path']
+    if not os.path.exists(video_path):
+        return jsonify({'success': False, 'message': '视频文件不存在'}), 404
+
+    quality = max(1, min(95, int(request.args.get('quality', 85))))
+
+    accessor = FFmpegAccessor()
+    tb_num = video.get('v_time_base_num')
+    tb_den = video.get('v_time_base_den')
+    if not (tb_num and tb_den):
+        try:
+            tb_num, tb_den, fps = accessor.robust_probe_time_base_and_fps(video_path)
+            video_db.update_video(video['id'], v_time_base_num=tb_num, v_time_base_den=tb_den)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({'success': False, 'message': f'探测视频元数据失败: {e}'}), 500
+
+    frame_pts = frame.get('frame_pts')
+    if frame_pts is not None:
+        t_sec = frame_pts * (tb_num / tb_den)
+    else:
+        pts_ms = frame.get('pts_ms')
+        if pts_ms is None:
+            return jsonify({'success': False, 'message': '缺少帧时间信息（frame_pts/pts_ms）'}), 400
+        t_sec = pts_ms / 1000.0
+
+    try:
+        data = accessor.extract_frame_bytes_by_sec(
+            video_path=video_path,
+            t_sec=t_sec,
+            quality=quality
+        )
+        return send_file(BytesIO(data), mimetype='image/jpeg')
+    except Exception as e:
+        traceback.print_exc()
+        # 尝试基于 seed_video_id 的参数集修复（仅 H.264）
+        seed_id = request.args.get('seed_video_id', type=int)
+        if seed_id:
+            seed = video_db.get_video(seed_id)
+            if seed and os.path.exists(seed['path']):
+                try:
+                    data = accessor.extract_frame_bytes_by_sec_with_seed(
+                        broken_video_path=video_path,
+                        t_sec=t_sec,
+                        seed_video_path=seed['path'],
+                        assumed_fps=25,
+                        quality=quality
+                    )
+                    return send_file(BytesIO(data), mimetype='image/jpeg')
+                except Exception as e2:
+                    traceback.print_exc()
+                    return jsonify({'success': False, 'message': f'按需抽帧失败(含seed修复): {e2}'}), 500
+        return jsonify({'success': False, 'message': f'按需抽帧失败: {e}'}), 500
 
 
 @frame_bp.route('/frames/statistics', methods=['GET'])

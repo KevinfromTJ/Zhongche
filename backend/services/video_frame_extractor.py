@@ -11,11 +11,18 @@ from imageio_ffmpeg import get_ffmpeg_exe
 from typing import Tuple, Optional, Dict, List
 from datetime import datetime
 import sys
+import re
 
 # 添加父目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.video_database import video_db
+from services.frame_accessor import FFmpegAccessor
 
+def clean_dir(dir_path: str):
+    """清理目录下所有文件和子目录"""
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path)
+    os.makedirs(dir_path, exist_ok=True)
 
 class VideoFrameExtractor:
     """视频帧提取器"""
@@ -120,7 +127,7 @@ class VideoFrameExtractor:
             video_path: 视频路径
             video_id: 视频ID（如果已在数据库中）
             max_frames: 最大提取帧数（超过则等间隔采样）
-            sample_rate: 采样率（每N帧提取1帧）
+            sample_rate: 采样率（每N帧提取1帧， 会覆盖上一个参数）
             save_to_db: 是否保存到数据库
         
         Returns:
@@ -133,7 +140,7 @@ class VideoFrameExtractor:
             }
         """
         start_time = datetime.now()
-        
+        output_dir = ""
         try:
             # 1. 获取视频元数据
             print(f"\n📹 开始处理视频: {video_path}")
@@ -179,6 +186,8 @@ class VideoFrameExtractor:
                 if save_to_db:
                     video_db.update_video(video_id, status='extracted')
                 
+                clean_dir(output_dir)
+
                 return {
                     'success': True,
                     'video_id': video_id,
@@ -208,15 +217,15 @@ class VideoFrameExtractor:
                 estimated_output = total_frames
                 print(f"   策略: 提取所有 {total_frames} 帧")
             
-            # 5. 开始提取（优先 imageio，失败则回退到 ffmpeg 可执行文件）
+            # 5. 开始提取（优先 ffmpeg 带 -frame_pts 以便记录精确 PTS；失败再回退 imageio）
             try:
-                extracted_frames = self._extract_with_imageio(
+                extracted_frames = self._extract_with_ffmpeg_cli_pts(
                     video_path, output_dir, video_id, sample_interval,
                     metadata['fps'], save_to_db
                 )
-            except Exception as e_img:
-                print(f"⚠️  imageio 提取失败，尝试使用 ffmpeg 回退: {e_img}")
-                extracted_frames = self._extract_with_ffmpeg_cli(
+            except Exception as e_ff:
+                print(f"⚠️  ffmpeg PTS 提取失败，尝试使用 imageio 回退: {e_ff}")
+                extracted_frames = self._extract_with_imageio(
                     video_path, output_dir, video_id, sample_interval,
                     metadata['fps'], save_to_db
                 )
@@ -241,6 +250,9 @@ class VideoFrameExtractor:
             
             print(f"✅ 提取完成: {extracted_frames} 帧，用时 {(datetime.now() - start_time).total_seconds():.2f}s")
             
+            # 清理output_dir，仅保留文件夹本身
+            clean_dir(output_dir)
+
             return {
                 'success': True,
                 'video_id': video_id,
@@ -264,6 +276,8 @@ class VideoFrameExtractor:
                     duration_sec=duration
                 )
             
+            clean_dir(output_dir)
+
             return {
                 'success': False,
                 'video_id': video_id,
@@ -352,46 +366,37 @@ class VideoFrameExtractor:
         reader.close()
         return extracted_count
     
-    def _extract_with_ffmpeg_cli(self, video_path: str, output_dir: str,
-                                 video_id: int, sample_interval: int,
-                                 fps: float, save_to_db: bool) -> int:
+    def _extract_with_ffmpeg_cli_pts(self, video_path: str, output_dir: str,
+                                     video_id: int, sample_interval: int,
+                                     fps: float, save_to_db: bool) -> int:
         """
-        使用 imageio-ffmpeg 提供的 ffmpeg 可执行文件作为最后手段提取帧
-        - 不依赖系统已安装 ffmpeg
-        - 对部分损坏/非常规封装的视频更鲁棒
+        使用 imageio-ffmpeg 提供的 ffmpeg 抽帧：
+        - 启用 -frame_pts 1，使文件名包含帧 PTS 以便精确索引
+        - 失败时会在上层回退到 imageio
         """
-        ffmpeg_path = get_ffmpeg_exe()
+        accessor = FFmpegAccessor()
         # 先输出到临时目录，成功入库后再迁移，失败则清理临时目录，保证原子性
         tmp_dir = os.path.join(output_dir, ".tmp_ffmpeg")
         os.makedirs(tmp_dir, exist_ok=True)
-        output_pattern = os.path.join(tmp_dir, "frame_%06d.jpg")
-        
-        vf = None
-        if sample_interval and sample_interval > 1:
-            # 每 N 帧选一帧
-            # 解释：not(mod(n\,N)) 选择第0、N、2N...帧；setpts 纠正时间戳
-            vf = f"select='not(mod(n\\,{sample_interval}))',setpts=N/FRAME_RATE/TB"
-        
-        cmd = [
-            ffmpeg_path,
-            "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", video_path,
-            "-vsync", "vfr",
-        ]
-        if vf:
-            cmd += ["-vf", vf]
-        cmd += ["-q:v", "2", "-start_number", "0", output_pattern]
-        
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            # 失败清理临时目录
-            try:
-                if os.path.exists(tmp_dir):
-                    shutil.rmtree(tmp_dir)
-            except Exception:
-                pass
-            raise RuntimeError(f"ffmpeg 回退提取失败: {e}") from e
+
+        # 探测视频流 time_base & fps（带原始码流兜底）
+        tb_num, tb_den, probed_fps = accessor.robust_probe_time_base_and_fps(video_path)
+        if probed_fps and probed_fps > 0:
+            fps = probed_fps
+        # 持久化视频级元数据
+        video_db.update_video(
+            video_id,
+            v_stream_index=0,  # 此处约定选择 0 号视频流
+            v_time_base_num=tb_num,
+            v_time_base_den=tb_den,
+        )
+
+        # 抽帧（文件名为 PTS）
+        _ = accessor.extract_frames_to_dir_with_pts(
+            video_path=video_path,
+            out_dir=tmp_dir,
+            sample_interval=sample_interval or 1,
+        )
         
         # 扫描生成的帧文件并写入数据库
         files = sorted(f for f in os.listdir(tmp_dir) if f.startswith("frame_") and f.endswith(".jpg"))
@@ -401,15 +406,22 @@ class VideoFrameExtractor:
         
         for i, fname in enumerate(files):
             image_path = os.path.join(tmp_dir, fname)
-            # 估算原始帧序号（按间隔近似）
+            # 估算原始帧序号（按间隔）
             frame_idx = i * (sample_interval if sample_interval else 1)
-            pts_ms = int((frame_idx / fps) * 1000) if fps and fps > 0 else frame_idx * 40
+            # 从文件名解析 PTS 并换算 ms： ms = pts * num/den * 1000
+            m = re.match(r"frame_(\d+)\.jpg$", fname)
+            frame_pts = int(m.group(1)) if m else None
+            if frame_pts is not None and tb_den and tb_num:
+                pts_ms = int(round((frame_pts * tb_num / tb_den) * 1000.0))
+            else:
+                pts_ms = int((frame_idx / fps) * 1000) if fps and fps > 0 else frame_idx * 40
             
             if save_to_db:
                 frames_buffer.append({
                     'video_id': video_id,
                     'frame_idx': frame_idx,
                     'pts_ms': pts_ms,
+                    'frame_pts': frame_pts,
                     'image_path': image_path
                 })
                 if len(frames_buffer) >= buffer_size:

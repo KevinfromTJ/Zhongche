@@ -27,7 +27,7 @@ SAM_MODEL_TYPE = 'vit_b'
 SAM_DEVICE = 'cuda'
 
 # 分类模型配置
-CLASSIFIER_CHECKPOINT = './ai_models/classifier/best_resnet50_scene.pth'
+CLASSIFIER_CHECKPOINT = os.path.join(BASE_DIR, 'ai_models', 'classifier', 'best_resnet50_scene.pth')
 CLASSIFIER_NUM_CLASSES = 8
 CLASSIFIER_CLASS_NAMES = [
     "穿过高架桥",

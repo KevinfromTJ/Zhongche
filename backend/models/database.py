@@ -10,19 +10,8 @@ from config import DATABASE_PATH
 
 def get_db():
     """获取数据库连接"""
-    # conn = sqlite3.connect(DATABASE_PATH) # 原来是这样的吧
-    conn = sqlite3.connect(
-        DATABASE_PATH,
-        timeout=30.0,
-        check_same_thread=False
-    )
+    conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
-    # 提升健壮性与并发能力
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    conn.execute('PRAGMA foreign_keys=ON')
-    conn.execute('PRAGMA cache_size=-10000')
-    conn.execute('PRAGMA busy_timeout=30000')
     return conn
 
 def init_db():
@@ -56,6 +45,8 @@ def init_db():
             filepath TEXT NOT NULL,
             is_annotated INTEGER DEFAULT 0,  -- 0=未标注, 1=已标注
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source_type TEXT DEFAULT 'upload',  -- 'upload'=用户上传, 'video_frame'=视频帧导入
+            source_video_frame_id INTEGER,  -- 如果是从视频帧导入，记录原始的 frame_id
             FOREIGN KEY (dataset_id) REFERENCES datasets(id)
         )
     ''')
@@ -93,10 +84,18 @@ def init_db():
             dataset_id INTEGER NOT NULL,
             task_type TEXT NOT NULL,  -- active_learning/specify_model
             model_path TEXT,  -- 指定模型的checkpoint路径
-            status TEXT DEFAULT 'pending',  -- pending/running/completed/failed
+            status TEXT DEFAULT 'pending',  -- pending/running/completed/failed/training/inferring
             progress INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            
+            -- 主动学习专用字段
+            current_round INTEGER DEFAULT 0,  -- 当前轮次（0表示未开始）
+            batch_size INTEGER DEFAULT 20,  -- 每轮预标注数量
+            total_annotated INTEGER DEFAULT 0,  -- 累计已标注数量
+            current_checkpoint TEXT,  -- 当前轮次的checkpoint路径
+            round_history TEXT,  -- JSON格式的轮次历史记录
+            
             FOREIGN KEY (dataset_id) REFERENCES datasets(id)
         )
     ''')
@@ -155,14 +154,14 @@ def delete_dataset(dataset_id):
     conn.close()
 
 # 图片操作函数
-def add_image(dataset_id, filename, filepath):
+def add_image(dataset_id, filename, filepath, source_type='upload', source_video_frame_id=None):
     """添加图片到数据集"""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO images (dataset_id, filename, filepath)
-        VALUES (?, ?, ?)
-    ''', (dataset_id, filename, filepath))
+        INSERT INTO images (dataset_id, filename, filepath, source_type, source_video_frame_id)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (dataset_id, filename, filepath, source_type, source_video_frame_id))
     image_id = cursor.lastrowid
     
     # 更新数据集图片数量
@@ -205,31 +204,61 @@ def save_annotation(image_id, dataset_id, annotation_data):
     conn = get_db()
     cursor = conn.cursor()
     
-    # 检查是否已有标注
+    # 👇 判断是否为空标注
+    is_empty = True
+    if 'shapes' in annotation_data and len(annotation_data['shapes']) > 0:
+        is_empty = False
+    elif 'classification' in annotation_data and annotation_data['classification']:
+        is_empty = False
+    elif 'ocrResults' in annotation_data and len(annotation_data['ocrResults']) > 0:
+        is_empty = False
+    
+    # 检查是否已有标注记录
     cursor.execute('SELECT id FROM annotations WHERE image_id = ?', (image_id,))
     existing = cursor.fetchone()
     
-    if existing:
-        # 更新现有标注
-        cursor.execute('''
-            UPDATE annotations SET annotation_data = ?, updated_at = ?
-            WHERE image_id = ?
-        ''', (json.dumps(annotation_data), datetime.now(), image_id))
-    else:
-        # 插入新标注
-        cursor.execute('''
-            INSERT INTO annotations (image_id, dataset_id, annotation_data)
-            VALUES (?, ?, ?)
-        ''', (image_id, dataset_id, json.dumps(annotation_data)))
+    # 👇 获取当前图片的标注状态
+    cursor.execute('SELECT is_annotated FROM images WHERE id = ?', (image_id,))
+    current_status = cursor.fetchone()
+    was_annotated = current_status['is_annotated'] if current_status else 0
+    
+    if is_empty:
+        # 👇 空标注：删除标注记录，设置 is_annotated = 0
+        if existing:
+            cursor.execute('DELETE FROM annotations WHERE image_id = ?', (image_id,))
         
-        # 更新图片标注状态
+        cursor.execute('UPDATE images SET is_annotated = 0 WHERE id = ?', (image_id,))
+        
+        # 👇 如果之前是已标注状态，需要减少计数
+        if was_annotated == 1:
+            cursor.execute('''
+                UPDATE datasets SET annotated_count = annotated_count - 1, updated_at = ?
+                WHERE id = ?
+            ''', (datetime.now(), dataset_id))
+    else:
+        # 👇 有内容的标注
+        if existing:
+            # 更新现有标注
+            cursor.execute('''
+                UPDATE annotations SET annotation_data = ?, updated_at = ?
+                WHERE image_id = ?
+            ''', (json.dumps(annotation_data), datetime.now(), image_id))
+        else:
+            # 插入新标注
+            cursor.execute('''
+                INSERT INTO annotations (image_id, dataset_id, annotation_data)
+                VALUES (?, ?, ?)
+            ''', (image_id, dataset_id, json.dumps(annotation_data)))
+        
+        # 👇 设置 is_annotated = 1
         cursor.execute('UPDATE images SET is_annotated = 1 WHERE id = ?', (image_id,))
         
-        # 更新数据集已标注数量
-        cursor.execute('''
-            UPDATE datasets SET annotated_count = annotated_count + 1, updated_at = ?
-            WHERE id = ?
-        ''', (datetime.now(), dataset_id))
+        # 👇 如果之前是未标注状态，需要增加计数
+        if was_annotated == 0:
+            cursor.execute('''
+                UPDATE datasets SET annotated_count = annotated_count + 1, updated_at = ?
+                WHERE id = ?
+            ''', (datetime.now(), dataset_id))
     
     conn.commit()
     conn.close()

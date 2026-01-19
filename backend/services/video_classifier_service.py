@@ -1,31 +1,109 @@
 """
-视频分类服务（占位实现）
-模拟多标签场景分类：天气、位置、时段、异常等
+视频分类服务
+调用 ResNet50 模型进行场景分类
 """
-import random
+import torch
+import torchvision.models as models
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+import os
+import sys
 from typing import Dict, List
-import json
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 全局变量
+_classifier_model = None
+_classifier_device = None
+_classifier_transform = None
+
+
+def get_classifier():
+    """获取分类器（单例模式）"""
+    global _classifier_model, _classifier_device, _classifier_transform
+    
+    if _classifier_model is None:
+        print("正在加载分类模型 (ResNet50)...")
+        from config import CLASSIFIER_CHECKPOINT, CLASSIFIER_NUM_CLASSES
+        
+        _classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"  使用设备: {_classifier_device}")
+        
+        # 加载模型
+        _classifier_model = models.resnet50(weights=None)
+        _classifier_model.fc = nn.Linear(_classifier_model.fc.in_features, CLASSIFIER_NUM_CLASSES)
+        _classifier_model.load_state_dict(torch.load(CLASSIFIER_CHECKPOINT, map_location=_classifier_device))
+        _classifier_model.eval().to(_classifier_device)
+        
+        # 预处理
+        _classifier_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.5037570595741272, 0.5405001640319824, 0.5926753878593445],
+                std=[0.21774673461914062, 0.20995022356510162, 0.21212837100028992]
+            )
+        ])
+        
+        print("分类模型加载完成")
+    
+    return _classifier_model, _classifier_device, _classifier_transform
+
+
+def predict_image(image_path):
+    """对单张图片进行分类预测"""
+    from config import CLASSIFIER_CLASS_NAMES
+    
+    model, device, transform = get_classifier()
+    
+    # 读取并预处理图像
+    img = Image.open(image_path).convert("RGB")
+    input_tensor = transform(img).unsqueeze(0).to(device)
+    
+    # 推理
+    with torch.no_grad():
+        output = model(input_tensor)
+        probabilities = torch.softmax(output, dim=1)
+        pred_idx = torch.argmax(probabilities, dim=1).item()
+        confidence = probabilities[0][pred_idx].item()
+        all_probs = probabilities[0].cpu().numpy().tolist()
+    
+    class_name = CLASSIFIER_CLASS_NAMES[pred_idx] if pred_idx < len(CLASSIFIER_CLASS_NAMES) else f"类别{pred_idx}"
+    
+    return pred_idx, class_name, confidence, all_probs
 
 
 class VideoClassifierService:
-    """视频场景分类服务（占位）"""
+    """视频场景分类服务"""
     
     def __init__(self):
-        # 定义标签类别
-        self.weather_labels = ['晴天', '阴天', '雨天', '雾天', '雪天']
-        self.location_labels = ['站台', '隧道内', '出站', '进站', '桥梁', '平原', '山区']
-        self.time_period_labels = ['白天', '夜晚', '黄昏', '黎明']
-        self.anomaly_labels = ['正常', '异常']
+        # 标签映射（根据你的8个类别）
+        # "穿过高架桥", "阴天", "晴天无太阳", "镜头雨滴", "黑夜", "隧道内", "暴雨", "太阳光直射弓头"
         
-        # 标签权重（用于模拟真实分布）
-        self.weather_weights = [0.5, 0.25, 0.15, 0.05, 0.05]
-        self.location_weights = [0.1, 0.2, 0.1, 0.1, 0.15, 0.25, 0.1]
-        self.time_period_weights = [0.6, 0.25, 0.1, 0.05]
-        self.anomaly_weights = [0.95, 0.05]
+        self.class_to_weather = {
+            "晴天无太阳": "晴天",
+            "阴天": "阴天",
+            "镜头雨滴": "雨天",
+            "暴雨": "雨天"
+        }
+        
+        self.class_to_location = {
+            "穿过高架桥": "桥梁",
+            "隧道内": "隧道内"
+        }
+        
+        self.class_to_time_period = {
+            "黑夜": "夜晚",
+            "太阳光直射弓头": "白天",
+            "晴天无太阳": "白天",
+            "阴天": "白天"
+        }
     
     def classify(self, image_path: str, frame_idx: int = 0) -> Dict:
         """
-        对图片进行多标签分类（模拟）
+        对图片进行分类
         
         Args:
             image_path: 图片路径
@@ -34,126 +112,43 @@ class VideoClassifierService:
         Returns:
             分类结果字典
         """
-        # 标记帧：与 OCR 保持一致（frame_idx % 300 == 0）
-        is_target = (frame_idx % 300 == 0)
-        if is_target:
-            weather = '晴天'
-            location = '隧道内'
-            time_period = '白天'
-            anomaly = '正常'
-            weather_score = 0.95
-            location_score = 0.95
-            time_period_score = 0.98
-            anomaly_score = 0.98
-        else:
-            # 天气分类
-            weather = random.choices(
-                self.weather_labels, 
-                weights=self.weather_weights, 
-                k=1
-            )[0]
-            weather_score = random.uniform(0.75, 0.98)
-            
-            # 位置分类
-            location = random.choices(
-                self.location_labels, 
-                weights=self.location_weights, 
-                k=1
-            )[0]
-            location_score = random.uniform(0.70, 0.95)
-            
-            # 时段分类
-            time_period = random.choices(
-                self.time_period_labels, 
-                weights=self.time_period_weights, 
-                k=1
-            )[0]
-            time_period_score = random.uniform(0.80, 0.99)
-            
-            # 异常检测
-            anomaly = random.choices(
-                self.anomaly_labels, 
-                weights=self.anomaly_weights, 
-                k=1
-            )[0]
-            anomaly_score = random.uniform(0.90, 0.99) if anomaly == '正常' else random.uniform(0.60, 0.85)
+        # 调用 ResNet50 模型
+        class_idx, class_name, confidence, all_probs = predict_image(image_path)
         
-        # 构造完整的标签JSON（包含所有分类器的结果）
+        # 将分类结果映射到多维度标签
+        weather = self.class_to_weather.get(class_name, None)
+        location = self.class_to_location.get(class_name, None)
+        time_period = self.class_to_time_period.get(class_name, None)
+        
+        # 获取所有类别名称
+        from config import CLASSIFIER_CLASS_NAMES
+        
+        # 构造完整的标签JSON
         labels_json = {
-            'weather': {
-                'label': weather,
-                'score': round(weather_score, 4),
-                'all_scores': self._generate_scores(self.weather_labels, weather)
-            },
-            'location': {
-                'label': location,
-                'score': round(location_score, 4),
-                'all_scores': self._generate_scores(self.location_labels, location)
-            },
-            'time_period': {
-                'label': time_period,
-                'score': round(time_period_score, 4),
-                'all_scores': self._generate_scores(self.time_period_labels, time_period)
-            },
-            'anomaly': {
-                'label': anomaly,
-                'score': round(anomaly_score, 4),
-                'all_scores': self._generate_scores(self.anomaly_labels, anomaly)
+            'primary_class': class_name,
+            'primary_confidence': round(confidence, 4),
+            'all_classes': {
+                name: round(prob, 4) 
+                for name, prob in zip(CLASSIFIER_CLASS_NAMES, all_probs)
             }
         }
         
         result = {
             'label_weather': weather,
-            'label_weather_score': round(weather_score, 4),
+            'label_weather_score': round(confidence, 4) if weather else None,
             'label_location': location,
-            'label_location_score': round(location_score, 4),
+            'label_location_score': round(confidence, 4) if location else None,
             'label_time_period': time_period,
-            'label_time_period_score': round(time_period_score, 4),
-            'label_anomaly': anomaly,
-            'label_anomaly_score': round(anomaly_score, 4),
+            'label_time_period_score': round(confidence, 4) if time_period else None,
+            'label_anomaly': '正常',  # 默认正常，可以后续扩展
+            'label_anomaly_score': 0.95,
             'labels_json': labels_json
         }
         
         return result
     
-    def _generate_scores(self, labels: List[str], selected_label: str) -> Dict[str, float]:
-        """生成所有标签的分数（最高分为选中的标签）"""
-        scores = {}
-        total_remaining = 1.0
-        
-        for label in labels:
-            if label == selected_label:
-                # 选中的标签得分最高
-                scores[label] = round(random.uniform(0.70, 0.95), 4)
-                total_remaining -= scores[label]
-            else:
-                continue
-        
-        # 为其他标签分配剩余分数
-        remaining_labels = [l for l in labels if l != selected_label]
-        if remaining_labels:
-            for i, label in enumerate(remaining_labels):
-                if i == len(remaining_labels) - 1:
-                    # 最后一个标签获得剩余分数
-                    scores[label] = max(0.01, round(total_remaining, 4))
-                else:
-                    score = random.uniform(0.01, total_remaining / (len(remaining_labels) - i))
-                    scores[label] = round(score, 4)
-                    total_remaining -= scores[label]
-        
-        return scores
-    
     def batch_classify(self, image_paths: List[str], start_frame_idx: int = 0) -> List[Dict]:
-        """
-        批量分类
-        
-        Args:
-            image_paths: 图片路径列表
-            start_frame_idx: 起始帧序号
-        
-        Returns:
-            分类结果列表
-        """
+        """批量分类"""
         results = []
         for i, image_path in enumerate(image_paths):
             result = self.classify(image_path, start_frame_idx + i)
@@ -163,10 +158,10 @@ class VideoClassifierService:
     def get_label_categories(self) -> Dict:
         """获取所有标签类别"""
         return {
-            'weather': self.weather_labels,
-            'location': self.location_labels,
-            'time_period': self.time_period_labels,
-            'anomaly': self.anomaly_labels
+            'weather': ['晴天', '阴天', '雨天', '雾天', '雪天'],
+            'location': ['站台', '隧道内', '出站', '进站', '桥梁', '平原', '山区'],
+            'time_period': ['白天', '夜晚', '黄昏', '黎明'],
+            'anomaly': ['正常', '异常']
         }
 
 
@@ -176,23 +171,22 @@ video_classifier_service = VideoClassifierService()
 
 if __name__ == '__main__':
     # 测试
-    service = VideoClassifierService()
+    import sys
+    if len(sys.argv) > 1:
+        test_image = sys.argv[1]
+    else:
+        test_image = "/root/autodl-tmp/backend/data/video_frames/1/1/frame_000000.jpg"
     
-    print("🏷️  可用标签类别:")
-    categories = service.get_label_categories()
-    for category, labels in categories.items():
-        print(f"  {category}: {labels}")
-    
-    print("\n" + "="*60)
-    
-    # 模拟分类3帧
-    for i in range(3):
-        result = service.classify(f'frame_{i}.jpg', i)
-        print(f"\n帧 {i} 的分类结果:")
-        print(f"  天气: {result['label_weather']} ({result['label_weather_score']:.2%})")
-        print(f"  位置: {result['label_location']} ({result['label_location_score']:.2%})")
-        print(f"  时段: {result['label_time_period']} ({result['label_time_period_score']:.2%})")
-        print(f"  异常: {result['label_anomaly']} ({result['label_anomaly_score']:.2%})")
-        
-        # 打印完整JSON
-        print(f"  完整JSON: {json.dumps(result['labels_json'], ensure_ascii=False, indent=2)}")
+    if os.path.exists(test_image):
+        service = VideoClassifierService()
+        result = service.classify(test_image, 0)
+        print("\n=== 分类结果 ===")
+        for key, value in result.items():
+            if key != 'labels_json':
+                print(f"{key}: {value}")
+        print("\n完整JSON:")
+        import json
+        print(json.dumps(result['labels_json'], ensure_ascii=False, indent=2))
+    else:
+        print(f"测试图片不存在: {test_image}")
+        print("用法: python video_classifier_service.py <图片路径>")

@@ -115,6 +115,7 @@ results/
 test_outputs/
 
 # data (按需开启：如果你不想忽略数据就删掉这些)
+backend/
 data/
 datasets/
 *.npy

@@ -16,9 +16,10 @@ import time
 import os
 from pathlib import Path
 import zipfile
+from .config import PORT
 
 # API基础URL
-BASE_URL = "http://localhost:6009/api"
+BASE_URL = f"http://localhost:{PORT}/api"
 
 def print_separator(title=""):
     """打印分隔线"""

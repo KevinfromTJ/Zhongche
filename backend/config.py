@@ -54,6 +54,10 @@ PORT = 6009
 # 是否在AI处理完成后删除已落地的帧图片（仅保留数据库索引，按需抽帧）
 DELETE_FRAME_IMAGES_AFTER_AI = False
 
+# 视频抽帧默认配置
+DEFAULT_MAX_FRAMES = int(os.getenv("DEFAULT_MAX_FRAMES", "1000"))  # 默认最大抽帧数
+DEFAULT_SAMPLE_RATE = int(os.getenv("DEFAULT_SAMPLE_RATE", "10"))  # 默认采样率（每N帧抽1帧）
+
 # 智能标注模型目录配置
 CLASSIFICATION_MODELS_DIR = os.path.join(BASE_DIR, 'ai_models', 'classification')
 DETECTION_MODELS_DIR = os.path.join(BASE_DIR, 'ai_models', 'detection')

@@ -903,6 +903,143 @@ class VideoDatabase:
         self.close_conn()
         return frames
     
+    def advanced_query_frames(self, 
+                              conditions: Dict = None,
+                              video_ids: List[int] = None,
+                              limit: int = 100,
+                              offset: int = 0) -> List[Dict]:
+        """
+        高级帧查询，支持复杂条件组合
+        
+        Args:
+            conditions: 查询条件字典，支持嵌套逻辑
+                示例1 - 简单AND: {"ocr_train_no": "G4926", "label_weather": "晴天"}
+                示例2 - OR逻辑: {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]}
+                示例3 - NOT逻辑: {"$not": {"label_location": "隧道内"}}
+                示例4 - 复合: {"$and": [
+                    {"ocr_train_no": "G4926"},
+                    {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]},
+                    {"$not": {"label_location": "隧道内"}}
+                ]}
+                示例5 - 范围: {"ocr_speed": {"$gte": 200, "$lte": 300}}
+                示例6 - 模糊: {"ocr_route_section": {"$like": "广州"}}
+            video_ids: 限制在指定视频ID列表中查询（None表示所有视频）
+            limit: 返回数量
+            offset: 偏移量
+            
+        Returns:
+            符合条件的帧列表
+        """
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        
+        where_parts = []
+        params = []
+        
+        # 视频ID限制
+        if video_ids:
+            placeholders = ','.join(['?'] * len(video_ids))
+            where_parts.append(f'video_id IN ({placeholders})')
+            params.extend(video_ids)
+        
+        # 构建条件子句
+        if conditions:
+            condition_sql, condition_params = self._build_condition_sql(conditions)
+            if condition_sql:
+                where_parts.append(f'({condition_sql})')
+                params.extend(condition_params)
+        
+        # 组合WHERE子句
+        where_clause = ' AND '.join(where_parts) if where_parts else '1=1'
+        
+        sql = f'''
+            SELECT f.*, v.path as video_path, v.filename as video_filename
+            FROM frames f
+            JOIN videos v ON f.video_id = v.id
+            WHERE {where_clause}
+            ORDER BY f.ocr_time, f.frame_idx
+            LIMIT {limit} OFFSET {offset}
+        '''
+        
+        cursor.execute(sql, params)
+        frames = [dict(row) for row in cursor.fetchall()]
+        self.close_conn()
+        return frames
+    
+    def _build_condition_sql(self, conditions: Dict) -> Tuple[str, List]:
+        """
+        递归构建SQL条件子句
+        
+        Args:
+            conditions: 条件字典
+            
+        Returns:
+            (sql_string, params_list)
+        """
+        if not conditions:
+            return '', []
+        
+        # 处理逻辑操作符
+        if '$and' in conditions:
+            sub_conditions = []
+            all_params = []
+            for sub_cond in conditions['$and']:
+                sql, params = self._build_condition_sql(sub_cond)
+                if sql:
+                    sub_conditions.append(f'({sql})')
+                    all_params.extend(params)
+            return ' AND '.join(sub_conditions), all_params
+        
+        elif '$or' in conditions:
+            sub_conditions = []
+            all_params = []
+            for sub_cond in conditions['$or']:
+                sql, params = self._build_condition_sql(sub_cond)
+                if sql:
+                    sub_conditions.append(f'({sql})')
+                    all_params.extend(params)
+            return ' OR '.join(sub_conditions), all_params
+        
+        elif '$not' in conditions:
+            sql, params = self._build_condition_sql(conditions['$not'])
+            return f'NOT ({sql})', params
+        
+        # 处理字段条件
+        else:
+            field_conditions = []
+            all_params = []
+            
+            for field, value in conditions.items():
+                if field.startswith('$'):
+                    continue  # 跳过操作符
+                
+                # 处理复杂值（范围、模糊匹配等）
+                if isinstance(value, dict):
+                    if '$gte' in value:
+                        field_conditions.append(f'{field} >= ?')
+                        all_params.append(value['$gte'])
+                    if '$lte' in value:
+                        field_conditions.append(f'{field} <= ?')
+                        all_params.append(value['$lte'])
+                    if '$gt' in value:
+                        field_conditions.append(f'{field} > ?')
+                        all_params.append(value['$gt'])
+                    if '$lt' in value:
+                        field_conditions.append(f'{field} < ?')
+                        all_params.append(value['$lt'])
+                    if '$like' in value:
+                        field_conditions.append(f'{field} LIKE ?')
+                        all_params.append(f'%{value["$like"]}%')
+                    if '$ne' in value:
+                        field_conditions.append(f'{field} != ?')
+                        all_params.append(value['$ne'])
+                else:
+                    # 简单相等匹配
+                    field_conditions.append(f'{field} = ?')
+                    all_params.append(value)
+            
+            return ' AND '.join(field_conditions), all_params
+    
     def get_statistics(self) -> Dict:
         """获取统计信息"""
         conn = self.get_conn()

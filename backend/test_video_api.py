@@ -538,32 +538,173 @@ def test_get_stats():
     
     return {}
 
+
 # ============================================================================
-# 新增测试: /videos/<id>/image-at?t=...（含 seed 修复）
+# 测试13: 高级查询功能（仅返回JSON）
 # ============================================================================
-'''
-def test_video_image_at(video_id, seed_video_id=None, t_list=None):
-    print_separator("新增测试: /videos/<id>/image-at")
-    if not t_list:
-        t_list = [0.0, 1.0, 2.0, 5.0]
-    out_dir = os.path.join(TEST_OUT_ROOT, "image_at", f"video_{video_id}")
-    os.makedirs(out_dir, exist_ok=True)
-    ok = 0
-    for t in t_list:
-        params = {"t": t, "quality": 85}
-        if seed_video_id is not None:
-            params["seed_video_id"] = seed_video_id
-        resp = requests.get(f"{BASE_URL}/videos/{video_id}/image-at", params=params)
-        if resp.status_code == 200 and resp.headers.get("Content-Type","").startswith("image/"):
-            out_path = os.path.join(out_dir, f"t_{str(t).replace('.','_')}.jpg")
-            with open(out_path, "wb") as wf:
-                wf.write(resp.content)
-            ok += 1
+def test_advanced_query_json(video_path_lst=None):
+    """测试高级查询功能（仅返回JSON数据）"""
+    print_separator("测试13: 高级查询（JSON模式）")
+    
+    # 测试案例1: 简单AND条件
+    print("\n案例1: 简单AND条件 - 车次G6126且速度>=200")
+    data1 = {
+        "video_paths": [] if video_path_lst is None else video_path_lst,
+        "conditions": {
+            "ocr_train_no": "G6126",
+            "ocr_speed": {"$gte": 200}
+        },
+        "limit": 10,
+        "extract_images": False
+    }
+    
+    try:
+        response = requests.post(f"{BASE_URL}/frames/advanced-query", json=data1)
+        print_response(response)
+        
+        if response.status_code == 200:
+            result = response.json()
+            count = result.get('count', 0)
+            print(f"\n✓ 找到 {count} 帧符合条件")
+            if count > 0:
+                print(f"  示例帧: {result['data'][0]}")
+    except Exception as e:
+        print(f"✗ 查询失败: {str(e)}")
+    
+    time.sleep(1)
+    
+    # 测试案例2: OR条件
+    print("\n案例2: OR条件 - 天气为晴天或阴天")
+    data2 = {
+        "video_paths": [] if video_path_lst is None else video_path_lst,
+        "conditions": {
+            "$or": [
+                {"label_weather": "晴天"},
+                {"label_weather": "阴天"}
+            ]
+        },
+        "limit": 10,
+        "extract_images": False
+    }
+    
+    try:
+        response = requests.post(f"{BASE_URL}/frames/advanced-query", json=data2)
+        print_response(response)
+        
+        if response.status_code == 200:
+            result = response.json()
+            count = result.get('count', 0)
+            print(f"\n✓ 找到 {count} 帧符合条件")
+    except Exception as e:
+        print(f"✗ 查询失败: {str(e)}")
+    
+    time.sleep(1)
+    
+    # 测试案例3: 复合条件（AND + OR + NOT）
+    print("\n案例3: 复合条件 - 车次G6126，天气晴天或阴天，非隧道内")
+    data3 = {
+        "video_paths": [] if video_path_lst is None else video_path_lst,
+        "conditions": {
+            "$and": [
+                {"ocr_train_no": "G6126"},
+                {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]},
+                {"$not": {"label_location": "隧道内"}}
+            ]
+        },
+        "limit": 10,
+        "extract_images": False
+    }
+    
+    try:
+        response = requests.post(f"{BASE_URL}/frames/advanced-query", json=data3)
+        print_response(response)
+        
+        if response.status_code == 200:
+            result = response.json()
+            count = result.get('count', 0)
+            print(f"\n✓ 找到 {count} 帧符合条件")
+    except Exception as e:
+        print(f"✗ 查询失败: {str(e)}")
+    
+    time.sleep(1)
+    
+    # 测试案例4: 模糊匹配
+    print("\n案例4: 模糊匹配 - 区间包含'广州'")
+    data4 = {
+        "video_paths": [] if video_path_lst is None else video_path_lst,
+        "conditions": {
+            "ocr_route_section": {"$like": "广州"}
+        },
+        "limit": 10,
+        "extract_images": False
+    }
+    
+    try:
+        response = requests.post(f"{BASE_URL}/frames/advanced-query", json=data4)
+        print_response(response)
+        
+        if response.status_code == 200:
+            result = response.json()
+            count = result.get('count', 0)
+            print(f"\n✓ 找到 {count} 帧符合条件")
+    except Exception as e:
+        print(f"✗ 查询失败: {str(e)}")
+
+
+# ============================================================================
+# 测试14: 高级查询功能（返回ZIP图片包）
+# ============================================================================
+def test_advanced_query_with_images(video_path_lst=None):
+    """测试高级查询功能（返回ZIP图片包）"""
+    print_separator("测试14: 高级查询（ZIP图片模式）")
+    
+    print("\n测试: 速度=233的帧，并导出图片到ZIP")
+    data = {
+        "video_paths": [] if video_path_lst is None else video_path_lst,
+        "conditions": {
+            "ocr_speed": 233
+        },
+        "limit": 5,  # 限制5帧以快速测试
+        "extract_images": True,
+        "image_quality": 85
+    }
+    
+    try:
+        response = requests.post(f"{BASE_URL}/frames/advanced-query", json=data)
+        
+        if response.status_code == 200 and response.headers.get('Content-Type', '').startswith('application/zip'):
+            # 保存ZIP文件
+            zip_path = os.path.join(TEST_OUT_ROOT, f"advanced_query_{int(time.time())}.zip")
+            os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+            
+            with open(zip_path, 'wb') as f:
+                f.write(response.content)
+            
+            zip_size = len(response.content)
+            print(f"\n✓ 成功获取ZIP文件")
+            print(f"  文件大小: {zip_size} 字节")
+            print(f"  保存路径: {zip_path}")
+            
+            # 解压并查看内容
+            import zipfile
+            unzip_dir = os.path.join(TEST_OUT_ROOT, f"advanced_query_{int(time.time())}")
+            os.makedirs(unzip_dir, exist_ok=True)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(unzip_dir)
+                file_list = zf.namelist()
+                print(f"  解压到: {unzip_dir}")
+                print(f"  包含文件数: {len(file_list)}")
+                if file_list:
+                    print(f"  示例文件: {file_list[0]}")
         else:
-            print_response(resp)
-    print(f"image-at 成功: {ok}/{len(t_list)} -> 输出目录: {out_dir}")
-    return ok == len(t_list)
-'''
+            print(f"\n✗ 请求失败")
+            print_response(response)
+    
+    except Exception as e:
+        print(f"✗ 查询失败: {str(e)}")
+
+
 # ============================================================================
 # 主测试流程
 # ============================================================================
@@ -588,7 +729,8 @@ def run_all_tests():
     # video_id = None
     
     # # 1. 上传视频
-    video_path = "/data/chenjuntao/OtherProj/dataManage/test_wrong.MP4"
+    # video_path = "/data/chenjuntao/OtherProj/dataManage/test_wrong.MP4"
+    video_path = "/data1/sd_webui/first_8class_video/video/穿过高架桥/20250401_03_08_0835_G1384.MP4"
     video_id = test_upload_video(video_path=video_path)
     if not video_id:
         print("\n⚠ 视频上传失败，尝试获取现有视频...")
@@ -607,6 +749,7 @@ def run_all_tests():
         # 3. 视频抽帧
         # 设置 force_reprocess=True 可以在debug时强制重新抽帧
         if test_extract_frames(video_id, force_reprocess=False):
+            # exit()
             time.sleep(2)
             
             # 4. AI处理
@@ -648,9 +791,7 @@ def run_all_tests():
     )
     time.sleep(1)
     
-    test_query_by_labels(
-        weather="雨天",
-    )
+    test_query_by_labels(weather="雨天")
     test_query_by_labels(weather="晴天")
     time.sleep(1)
     
@@ -662,6 +803,15 @@ def run_all_tests():
     
     # 12. 统计信息
     test_get_stats()
+    
+    # 13-14. 高级查询测试
+    test_advanced_query_json()
+    time.sleep(1)
+    
+    test_advanced_query_with_images(
+        # video_path_lst=[video_path]
+        )
+    time.sleep(1)
     
     # 测试完成
     print_separator("测试完成")

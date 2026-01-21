@@ -10,10 +10,15 @@ import time
 import zipfile
 from typing import Dict, List
 import traceback
+from PIL import Image
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.video_database import video_db
 from services.frame_accessor import FFmpegAccessor
+from services.video_frame_extractor import VideoFrameExtractor
+from services.video_ocr_service import video_ocr_service
+from services.video_classifier_service import video_classifier_service
+from config import DEFAULT_MAX_FRAMES, DEFAULT_SAMPLE_RATE
 
 frame_bp = Blueprint('frame', __name__)
 
@@ -454,6 +459,264 @@ def get_date_range():
             'latest_time': last_row['ocr_time'] if last_row else first_frame.get('ocr_time')
         }
     })
+
+
+@frame_bp.route('/frames/advanced-query', methods=['POST'])
+def advanced_query_and_extract():
+    """
+    全面的帧查询与抽取功能
+    
+    支持功能：
+    1. 传入视频路径列表，自动处理未入库的视频（注册、抽帧、AI处理）
+    2. 支持复杂的查询条件组合（AND/OR/NOT逻辑）
+    3. 如果视频列表为空，在所有已入库视频中查询
+    4. 返回符合条件的帧信息
+    5. 可选：即时抽取帧图片到ZIP包
+    
+    POST JSON:
+    {
+        "video_paths": ["path/to/video1.mp4", "path/to/video2.mp4"],  // 可选，空数组表示所有视频
+        "conditions": {  // 查询条件
+            "$and": [
+                {"ocr_train_no": "G4926"},
+                {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]},
+                {"ocr_speed": {"$gte": 200, "$lte": 300}}
+            ]
+        },
+        "limit": 100,  // 返回数量限制，默认100
+        "offset": 0,   // 偏移量，默认0
+        "extract_images": true,  // 是否返回图片ZIP包，默认false
+        "image_quality": 85,  // 图片质量，默认85
+        "auto_process": true,  // 对未入库视频是否自动处理，默认true
+        "max_frames": 1000,  // 抽帧数量，默认使用配置
+        "sample_rate": 100  // 采样率，默认使用配置
+    }
+    
+    条件语法示例：
+    1. 简单AND: {"ocr_train_no": "G4926", "label_weather": "晴天"}
+    2. OR逻辑: {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]}
+    3. NOT逻辑: {"$not": {"label_location": "隧道内"}}
+    4. 范围查询: {"ocr_speed": {"$gte": 200, "$lte": 300}}
+    5. 模糊匹配: {"ocr_route_section": {"$like": "广州"}}
+    6. 不等于: {"label_weather": {"$ne": "雨天"}}
+    
+    Returns:
+        如果 extract_images=false: 返回JSON格式的帧信息列表
+        如果 extract_images=true: 返回ZIP文件包含所有符合条件的帧图片
+    """
+    try:
+        data = request.json or {}
+        
+        # 解析参数
+        video_paths = data.get('video_paths', [])
+        conditions = data.get('conditions', {})
+        limit = data.get('limit', 100)
+        offset = data.get('offset', 0)
+        extract_images = data.get('extract_images', False)
+        image_quality = data.get('image_quality', 85)
+        auto_process = data.get('auto_process', True)
+        max_frames = data.get('max_frames', DEFAULT_MAX_FRAMES)
+        sample_rate = data.get('sample_rate', DEFAULT_SAMPLE_RATE)
+        
+        print(f"\n📊 高级查询请求:")
+        print(f"   视频路径数量: {len(video_paths)}")
+        print(f"   查询条件: {conditions}")
+        print(f"   返回限制: {limit}, 偏移: {offset}")
+        print(f"   抽取图片: {extract_images}")
+        
+        # 步骤1: 处理视频路径列表
+        video_ids = []
+        
+        if video_paths:
+            print(f"\n🎬 处理 {len(video_paths)} 个视频...")
+            frame_extractor = VideoFrameExtractor()
+            
+            for i, video_path in enumerate(video_paths, 1):
+                print(f"\n   [{i}/{len(video_paths)}] 处理: {video_path}")
+                
+                if not os.path.exists(video_path):
+                    print(f"      ⚠️  视频文件不存在，跳过")
+                    continue
+                
+                # 检查是否已入库
+                video = video_db.get_video_by_path(video_path)
+                
+                if video:
+                    video_id = video['id']
+                    print(f"      ✓ 视频已入库，ID={video_id}")
+                    
+                    # 检查是否已抽帧和AI处理
+                    if auto_process and video['status'] != 'extracted':
+                        print(f"      → 视频未完成抽帧，开始抽帧...")
+                        result = frame_extractor.extract_frames(
+                            video_path=video_path,
+                            video_id=video_id,
+                            max_frames=max_frames,
+                            sample_rate=sample_rate,
+                            force_reprocess=False
+                        )
+                        if result['success']:
+                            print(f"      ✓ 抽帧完成: {result.get('extracted_frames', 0)} 帧")
+                    
+                    # 检查AI处理状态
+                    frames = video_db.list_frames(video_id=video_id, ai_processed=False, limit=1)
+                    if auto_process and frames:
+                        print(f"      → 存在未处理帧，开始AI处理...")
+                        # OCR处理
+                        unprocessed = video_db.list_frames(video_id=video_id, ai_processed=False, limit=10000)
+                        if unprocessed:
+                            print(f"         OCR处理中...")
+                            for frame in unprocessed:
+                                if os.path.exists(frame['image_path']):
+                                    ocr_result = video_ocr_service.extract_text(frame['image_path'], frame['frame_idx'])
+                                    video_db.update_frame_ocr(frame['id'], ocr_result)
+                        
+                        # 分类处理
+                        print(f"         分类处理中...")
+                        unprocessed = video_db.list_frames(video_id=video_id, ai_processed=False, limit=10000)
+                        if unprocessed:
+                            image_paths = [f['image_path'] for f in unprocessed if os.path.exists(f['image_path'])]
+                            if image_paths:
+                                labels = video_classifier_service.batch_classify(image_paths)
+                                for frame, label_info in zip(unprocessed, labels):
+                                    video_db.update_frame_classification(frame['id'], label_info)
+                        
+                        print(f"      ✓ AI处理完成")
+                else:
+                    # 新视频，需要注册并处理
+                    if not auto_process:
+                        print(f"      ⚠️  视频未入库且auto_process=False，跳过")
+                        continue
+                    
+                    print(f"      → 视频未入库，开始注册...")
+                    video_id = video_db.add_video(
+                        path=video_path,
+                        filename=os.path.basename(video_path),
+                        status='pending'
+                    )
+                    print(f"      ✓ 注册成功，ID={video_id}")
+                    
+                    # 抽帧
+                    print(f"      → 开始抽帧...")
+                    result = frame_extractor.extract_frames(
+                        video_path=video_path,
+                        video_id=video_id,
+                        max_frames=max_frames,
+                        sample_rate=sample_rate
+                    )
+                    if not result['success']:
+                        print(f"      ❌ 抽帧失败: {result.get('error')}")
+                        continue
+                    print(f"      ✓ 抽帧完成: {result.get('extracted_frames', 0)} 帧")
+                    
+                    # AI处理
+                    print(f"      → 开始AI处理...")
+                    frames = video_db.list_frames(video_id=video_id, limit=10000)
+                    
+                    # OCR
+                    print(f"         OCR处理中...")
+                    for frame in frames:
+                        if os.path.exists(frame['image_path']):
+                            ocr_result = video_ocr_service.extract_text(frame['image_path'], frame['frame_idx'])
+                            video_db.update_frame_ocr(frame['id'], ocr_result)
+                    
+                    # 分类
+                    print(f"         分类处理中...")
+                    image_paths = [f['image_path'] for f in frames if os.path.exists(f['image_path'])]
+                    if image_paths:
+                        labels = video_classifier_service.batch_classify(image_paths)
+                        for frame, label_info in zip(frames, labels):
+                            video_db.update_frame_classification(frame['id'], label_info)
+                    
+                    print(f"      ✓ AI处理完成")
+                
+                video_ids.append(video_id)
+            
+            print(f"\n✓ 视频处理完成，共 {len(video_ids)} 个视频")
+        else:
+            print(f"\n📂 未指定视频路径，将在所有已入库视频中查询")
+            video_ids = None  # None表示不限制视频范围
+        
+        # 步骤2: 执行高级查询
+        print(f"\n🔍 执行查询...")
+        frames = video_db.advanced_query_frames(
+            conditions=conditions,
+            video_ids=video_ids,
+            limit=limit,
+            offset=offset
+        )
+        
+        print(f"✓ 查询完成，找到 {len(frames)} 帧")
+        
+        # 步骤3: 返回结果
+        if not extract_images:
+            # 仅返回JSON信息
+            return jsonify({
+                'success': True,
+                'count': len(frames),
+                'data': frames,
+                'processed_videos': len(video_ids) if video_ids else 0
+            })
+        else:
+            # 抽取图片并返回ZIP
+            print(f"\n📦 开始打包图片...")
+            
+            zip_buffer = BytesIO()
+            accessor = FFmpegAccessor()
+            
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for i, frame in enumerate(frames, 1):
+                    try:
+                        # 优先使用已存在的图片
+                        if frame.get('image_path') and os.path.exists(frame['image_path']):
+                            zip_file.write(
+                                frame['image_path'],
+                                f"frame_{frame['id']:06d}_{frame['frame_idx']:08d}.jpg"
+                            )
+                        else:
+                            # 即时抽帧
+                            video_path = frame.get('video_path')
+                            if video_path and os.path.exists(video_path):
+                                # 计算时间位置（秒）
+                                video = video_db.get_video(frame['video_id'])
+                                fps = video.get('fps', 25)
+                                t_sec = frame['frame_idx'] / fps if fps > 0 else frame['pts_ms'] / 1000.0
+                                
+                                # 抽帧
+                                img_bytes = accessor.extract_frame_bytes_by_sec(
+                                    video_path, t_sec, quality=image_quality
+                                )
+                                
+                                # 添加到ZIP
+                                zip_file.writestr(
+                                    f"frame_{frame['id']:06d}_{frame['frame_idx']:08d}.jpg",
+                                    img_bytes
+                                )
+                        
+                        if i % 10 == 0:
+                            print(f"   已打包 {i}/{len(frames)} 帧...")
+                    
+                    except Exception as e:
+                        print(f"   ⚠️  帧 {frame['id']} 处理失败: {e}")
+                        continue
+            
+            zip_buffer.seek(0)
+            print(f"✓ 打包完成")
+            
+            return send_file(
+                zip_buffer,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=f'frames_{int(time.time())}.zip'
+            )
+    
+    except Exception as e:
+        print(f"❌ 高级查询失败: {e}")
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'message': f'查询失败: {str(e)}'
+        }), 500
 
 
 if __name__ == '__main__':

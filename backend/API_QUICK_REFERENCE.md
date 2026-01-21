@@ -36,6 +36,8 @@ python test_video_api.py
 | GET | `/api/frames/<id>` | 获取帧详情 |
 | GET | `/api/frames/query` | 多条件查询 ⭐ |
 | GET | `/api/frames/search` | OCR文本搜索（LIKE） 🔍 |
+| POST | `/api/frames/advanced-query` | 高级查询+即时抽帧 ⭐⭐ **新** |
+| POST | `/api/frames/batch-image` | 批量获取图片（ZIP） |
 | GET | `/api/frames/<id>/image` | 获取帧图片 |
 | GET | `/api/frames/statistics` | 获取统计分布 |
 | GET | `/api/frames/labels` | 获取可用标签 |
@@ -145,6 +147,54 @@ response = requests.get(f"{BASE_URL}/frames/query", params={
 })
 frames = response.json()['data']
 ```
+
+### 8. 高级查询（支持复杂逻辑） ⭐ **新功能**
+
+```python
+# 高级查询 - 仅返回JSON
+response = requests.post(f"{BASE_URL}/frames/advanced-query", json={
+    "video_paths": [],  # 空列表表示查询所有视频
+    "conditions": {
+        "$and": [
+            {"ocr_train_no": "G6126"},
+            {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]},
+            {"$not": {"label_location": "隧道内"}},
+            {"ocr_speed": {"$gte": 200, "$lte": 300}}
+        ]
+    },
+    "limit": 50,
+    "extract_images": False
+})
+frames = response.json()['data']
+
+# 高级查询 - 返回ZIP图片包
+response = requests.post(f"{BASE_URL}/frames/advanced-query", json={
+    "video_paths": ["/path/to/video1.mp4", "/path/to/video2.mp4"],
+    "conditions": {
+        "ocr_speed": 233
+    },
+    "limit": 10,
+    "extract_images": True,
+    "image_quality": 85,
+    "auto_process": True,  # 自动处理未入库的视频
+    "max_frames": 1000,
+    "sample_rate": 100
+})
+# 保存ZIP文件
+with open("frames.zip", "wb") as f:
+    f.write(response.content)
+```
+
+**条件语法说明**:
+- `$and`: AND逻辑（所有条件都满足）
+- `$or`: OR逻辑（任一条件满足）
+- `$not`: NOT逻辑（不满足条件）
+- `$gte`: 大于等于
+- `$lte`: 小于等于
+- `$gt`: 大于
+- `$lt`: 小于
+- `$like`: 模糊匹配
+- `$ne`: 不等于
 
 ---
 
@@ -261,6 +311,8 @@ sqlite> SELECT * FROM frames LIMIT 10;
 3. **批量操作**: AI处理时合理设置 `batch_size`
 4. **索引优化**: 已对常用查询字段建立索引
 5. **OCR搜索**: 使用 LIKE 包含匹配；建议结合结构化条件（如 `train_no`/时间范围）提升精度与性能
+6. **高级查询**: 对于复杂条件组合，使用 `/frames/advanced-query` 而不是多次简单查询
+7. **即时抽帧**: 仅在必要时使用 `extract_images=true`，大批量数据建议分批查询
 
 ---
 
@@ -269,8 +321,10 @@ sqlite> SELECT * FROM frames LIMIT 10;
 1. ✅ 所有时间使用ISO 8601格式
 2. ✅ 视频路径需要服务器可访问
 3. ✅ 支持中文搜索和标签
-4. ✅ 默认端口: 6008
+4. ✅ 默认端口: 6009（可在config.py修改）
 5. ✅ 数据库文件: 视频数据 `data/video_data.db`；标注数据 `data/easydata.db`
+6. ✅ 默认抽帧参数在 `config.py` 中配置：`DEFAULT_MAX_FRAMES` 和 `DEFAULT_SAMPLE_RATE`
+7. ✅ 高级查询支持自动处理未入库视频，设置 `auto_process=true` 即可
 
 ---
 

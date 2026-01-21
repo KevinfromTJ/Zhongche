@@ -126,15 +126,17 @@
 ```json
 {
   "max_frames": 100,
-  "sample_rate": 30
+  "sample_rate": 30,
+  "force_reprocess": false
 }
 ```
 
 **参数说明**:
-- `max_frames` (可选): 最大提取帧数
-- `sample_rate` (可选): 采样率（每N帧采样一次）
+- `max_frames` (可选): 最大提取帧数（默认：配置文件中的DEFAULT_MAX_FRAMES）
+- `sample_rate` (可选): 采样率（每N帧采样一次，默认：配置文件中的DEFAULT_SAMPLE_RATE）
+- `force_reprocess` (可选): 强制重新处理，跳过ai_processed检查（默认：false，用于debug）
 
-说明：抽帧为进程内串行执行（同一时刻仅一个抽帧任务执行），不再支持异步参数。
+说明：抽帧为进程内串行执行（同一时刻仅一个抽帧任务执行），不再支持异步参数。当 `force_reprocess=true` 时，会清空输出目录并强制重新抽帧，即使该视频的帧已经完成AI处理。
 
 **返回示例**:
 ```json
@@ -449,6 +451,100 @@ GET /api/frames/search?keyword=G4926&limit=20
   }
 }
 ```
+
+---
+
+### 9. 批量获取帧图片（ZIP包）
+
+**POST** `/api/frames/batch-image`
+
+**请求体**:
+```json
+{
+  "frame_ids": [1, 2, 3, 4, 5],
+  "quality": 85
+}
+```
+
+**参数说明**:
+- `frame_ids` (必需): 帧ID列表
+- `quality` (可选): 图片质量（1-95，默认：85）
+
+**返回**: ZIP文件包含所有请求的帧图片
+
+---
+
+### 10. 高级查询与即时抽帧 ⭐ **新功能**
+
+**POST** `/api/frames/advanced-query`
+
+这是一个全面的查询功能，支持：
+1. 传入视频路径列表，自动处理未入库的视频
+2. 复杂的查询条件组合（AND/OR/NOT逻辑）
+3. 如果视频列表为空，在所有已入库视频中查询
+4. 可选：即时抽取帧图片到ZIP包
+
+**请求体**:
+```json
+{
+  "video_paths": ["/path/to/video1.mp4", "/path/to/video2.mp4"],
+  "conditions": {
+    "$and": [
+      {"ocr_train_no": "G4926"},
+      {"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]},
+      {"ocr_speed": {"$gte": 200, "$lte": 300}}
+    ]
+  },
+  "limit": 100,
+  "offset": 0,
+  "extract_images": false,
+  "image_quality": 85,
+  "auto_process": true,
+  "max_frames": 1000,
+  "sample_rate": 100
+}
+```
+
+**参数说明**:
+- `video_paths` (可选): 视频路径列表，空数组表示查询所有视频
+- `conditions` (可选): 查询条件，支持复杂逻辑组合
+- `limit` (可选): 返回数量限制（默认：100）
+- `offset` (可选): 偏移量（默认：0）
+- `extract_images` (可选): 是否返回图片ZIP包（默认：false）
+- `image_quality` (可选): 图片质量（默认：85）
+- `auto_process` (可选): 对未入库视频是否自动处理（默认：true）
+- `max_frames` (可选): 抽帧数量（默认：使用配置）
+- `sample_rate` (可选): 采样率（默认：使用配置）
+
+**条件语法示例**:
+1. 简单AND: `{"ocr_train_no": "G4926", "label_weather": "晴天"}`
+2. OR逻辑: `{"$or": [{"label_weather": "晴天"}, {"label_weather": "阴天"}]}`
+3. NOT逻辑: `{"$not": {"label_location": "隧道内"}}`
+4. 范围查询: `{"ocr_speed": {"$gte": 200, "$lte": 300}}`
+5. 模糊匹配: `{"ocr_route_section": {"$like": "广州"}}`
+6. 不等于: `{"label_weather": {"$ne": "雨天"}}`
+7. 复合条件: 可以任意嵌套组合
+
+**返回示例（extract_images=false）**:
+```json
+{
+  "success": true,
+  "count": 25,
+  "processed_videos": 2,
+  "data": [
+    {
+      "id": 1,
+      "video_id": 1,
+      "frame_idx": 100,
+      "ocr_train_no": "G4926",
+      "label_weather": "晴天",
+      "ocr_speed": 250
+    }
+  ]
+}
+```
+
+**返回示例（extract_images=true）**: ZIP文件包含所有符合条件的帧图片
 
 ---
 

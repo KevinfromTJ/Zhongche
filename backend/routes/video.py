@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify, send_file
 import os
 import sys
 from datetime import datetime
+from io import BytesIO
 from werkzeug.utils import secure_filename
 import threading
 import traceback
@@ -157,6 +158,7 @@ def extract_video_frames(video_id):
     JSON参数:
         max_frames: 最大提取帧数（可选）
         sample_rate: 采样率（可选, 如果指定则忽略帧数）
+        force_reprocess: 强制重新处理，跳过ai_processed检查（可选，默认False，用于debug）
     """
     video = video_db.get_video(video_id)
     
@@ -166,25 +168,28 @@ def extract_video_frames(video_id):
     data = request.json or {}
     max_frames = data.get('max_frames')
     sample_rate = data.get('sample_rate')
+    force_reprocess = data.get('force_reprocess', False)
     # 强制串行：不使用后台线程，使用全局锁保证同一进程内抽帧按顺序执行
     with _extract_lock:
         result = frame_extractor.extract_frames(
             video_path=video['path'],
             video_id=video_id,
             max_frames=max_frames,
-            sample_rate=sample_rate
+            sample_rate=sample_rate,
+            force_reprocess=force_reprocess
         )
     return jsonify(result)
 
 
-def _extract_frames_background(video_path, video_id, max_frames, sample_rate):
+def _extract_frames_background(video_path, video_id, max_frames, sample_rate, force_reprocess=False):
     """后台执行抽帧任务"""
     try:
         frame_extractor.extract_frames(
             video_path=video_path,
             video_id=video_id,
             max_frames=max_frames,
-            sample_rate=sample_rate
+            sample_rate=sample_rate,
+            force_reprocess=force_reprocess
         )
     except Exception as e:
         print(f"❌ 后台抽帧失败: {e}")
@@ -265,6 +270,7 @@ def _process_video_ai_sync(video_id, batch_size=50):
                 )
                 
                 # 更新数据库
+                print(f"classification_result: {classification_result}")
                 video_db.update_frame_ai_results(
                     frame['id'],
                     ocr_results=ocr_result,
@@ -288,23 +294,15 @@ def _process_video_ai_sync(video_id, batch_size=50):
         # 可选：删除已落地的帧图片，仅保留数据库索引（按需抽帧）
         if DELETE_FRAME_IMAGES_AFTER_AI:
             try:
-                all_frames = video_db.list_frames(video_id=video_id)
-                removed = 0
-                for f in all_frames:
-                    p = f.get('image_path') or ''
-                    if p and os.path.exists(p):
-                        try:
-                            os.remove(p)
-                            removed += 1
-                        except Exception:
-                            pass
-                # 将 image_path 清空，避免前端误用
-                conn = video_db.get_conn()
-                cur = conn.cursor()
-                cur.execute("UPDATE frames SET image_path = '' WHERE video_id = ?", (video_id,))
-                conn.commit()
-                video_db.close_conn()
-                print(f"🧹 已清理帧图片: {removed} 个")
+                # 改为“独立清理”：只删除 frames 表中 image_path 非空 且 ai_processed=1 的图片，
+                # 避免误删未完成 AI 的帧图片导致后续处理失败。
+                stats = video_db.cleanup_processed_frame_images(video_id=None, clear_image_path=True)
+                print(
+                    "🧹 已清理已AI处理帧图片: "
+                    f"scanned={stats.get('scanned')}, removed={stats.get('removed')}, "
+                    f"missing={stats.get('missing')}, failed={stats.get('failed')}, "
+                    f"cleared={stats.get('cleared')}"
+                )
             except Exception as _e:
                 print(f"⚠️ 清理帧图片失败: {_e}")
         
@@ -384,11 +382,16 @@ def register_video_path():
     
     # 检查是否已注册
     existing = video_db.get_video_by_path(path)
+    # print(f"existing: {existing}")
+    # exit()
     if existing:
         return jsonify({
             'success': True,
             'message': '视频已存在',
-            'data': existing
+            'data': {
+                'id': existing['id'],
+                'path': existing['path']
+            },
         })
     
     # 注册到数据库
@@ -404,7 +407,7 @@ def register_video_path():
         'success': True,
         'message': '视频注册成功',
         'data': {
-            'video_id': video_id,
+            'id': video_id,
             'path': path
         }
     })

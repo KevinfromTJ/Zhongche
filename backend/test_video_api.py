@@ -16,7 +16,11 @@ import time
 import os
 from pathlib import Path
 import zipfile
-from .config import PORT
+from config import PORT
+
+# 重定向标准输出到指定文件
+import sys
+sys.stdout = open("/data/chenjuntao/OtherProj/dataManage/test.log", "w")
 
 # API基础URL
 BASE_URL = f"http://localhost:{PORT}/api"
@@ -76,7 +80,7 @@ def test_upload_video(video_path ="/data/chenjuntao/OtherProj/dataManage/test_wr
         if response.status_code == 200:
             result = response.json()
             if result.get('success'):
-                video_id = result['data']['video_id']
+                video_id = result['data']['id']
                 print(f"\n✓ 视频注册成功，ID: {video_id}")
                 return video_id
     except Exception as e:
@@ -108,19 +112,22 @@ def test_get_videos():
 # ============================================================================
 # 测试3: 视频抽帧
 # ============================================================================
-def test_extract_frames(video_id):
+def test_extract_frames(video_id, force_reprocess=False):
     """测试视频抽帧"""
     print_separator(f"测试3: 抽帧视频 (ID={video_id})")
     
     data = {
         # "max_frames": 100,  # 最多抽50帧
-        "sample_rate": 10,  # 每2秒抽1帧
-        "async": False  # 同步执行
+        "sample_rate": 100,  # 每2秒抽1帧
+        "async": False,  # 同步执行
+        "force_reprocess": force_reprocess  # 是否强制重新处理
     }
     if "sample_rate" in data.keys():
         print(f"开始抽帧，根据采样率约每: {data['sample_rate']} 采一帧")
     else:
         print(f"开始抽帧，根据最大帧数: {data['max_frames']}")
+    if force_reprocess:
+        print(f"   🔧 force_reprocess=True，强制重新抽帧（用于debug）")
 
     
     try:
@@ -130,7 +137,7 @@ def test_extract_frames(video_id):
         if response.status_code == 200:
             result = response.json()
             if result.get('success'):
-                frame_count = result.get('frame_count', 0)
+                frame_count = result.get('extracted_frames', 0)
                 print(f"\n✓ 抽帧成功，共 {frame_count} 帧")
                 return True
     except Exception as e:
@@ -273,12 +280,16 @@ def test_condition_query_and_extract(out_dir: str):
     os.makedirs(cond_dir, exist_ok=True)
 
     # 条件1：标记车次
-    params1 = {"train_no": "G-TARGET", "limit": 20, "offset": 0}
+    params1 = {
+        "min_speed": "233", 
+        "max_speed": "233",
+        "limit": 20, 
+        "offset": 0}
     r1 = requests.get(f"{BASE_URL}/frames/query", params=params1)
     print_response(r1)
     frames1 = r1.json().get("data", []) if r1.status_code == 200 else []
-    print(f"按车次=G-TARGET 命中: {len(frames1)}")
-    save1 = os.path.join(cond_dir, "train_G-TARGET")
+    print(f"按速度=233 命中: {len(frames1)}")
+    save1 = os.path.join(cond_dir, "speed_233")
     os.makedirs(save1, exist_ok=True)
     for f in frames1[:10]:
         fid = f["id"]
@@ -286,7 +297,7 @@ def test_condition_query_and_extract(out_dir: str):
         if resp.status_code == 200 and resp.headers.get("Content-Type","").startswith("image/"):
             with open(os.path.join(save1, f"frame_{fid}.jpg"), "wb") as wf:
                 wf.write(resp.content)
-
+    return 
     # 条件2：标记标签（位置=隧道内）
     params2 = {"location": "隧道内", "limit": 20, "offset": 0}
     r2 = requests.get(f"{BASE_URL}/frames/query", params=params2)
@@ -305,13 +316,13 @@ def test_condition_query_and_extract(out_dir: str):
 # ============================================================================
 # 测试6: 按时间范围查询
 # ============================================================================
-def test_query_by_time_range():
+def test_query_by_time_range(start_time="2025-02-14T00:00:00", end_time="2025-02-14T23:59:59"):
     """测试按时间范围查询"""
     print_separator("测试6: 按时间范围查询")
     
     params = {
-        "start_time": "2025-02-14T00:00:00",
-        "end_time": "2025-02-14T23:59:59",
+        "start_time": start_time,
+        "end_time": end_time,
         "limit": 20,
         "offset": 0
     }
@@ -336,12 +347,12 @@ def test_query_by_time_range():
 # ============================================================================
 # 测试7: 按车次查询
 # ============================================================================
-def test_query_by_train():
+def test_query_by_train(train_no="G4926"):
     """测试按车次查询"""
     print_separator("测试7: 按车次查询")
     
     params = {
-        "train_no": "G4926",
+        "train_no": train_no,
         "limit": 20,
         "offset": 0
     }
@@ -367,12 +378,12 @@ def test_query_by_train():
 # ============================================================================
 # 测试8: 按区间查询
 # ============================================================================
-def test_query_by_route():
+def test_query_by_route(route_section="广州南-韶关"):
     """测试按区间查询"""
     print_separator("测试8: 按区间查询")
     
     params = {
-        "route_section": "佛山西-宜宾",
+        "route_section": route_section,
         "limit": 20,
         "offset": 0
     }
@@ -398,18 +409,19 @@ def test_query_by_route():
 # ============================================================================
 # 测试9: 按标签查询（多标签）
 # ============================================================================
-def test_query_by_labels():
+def test_query_by_labels(weather="晴天", location=None):
     """测试按标签查询"""
     print_separator("测试9: 按标签查询")
     
     params = {
-        "weather": "晴天",
-        "location": "隧道内",
-        "limit": 20,
+        "weather": weather,
+        "limit": 2,
         "offset": 0
     }
-    
-    print(f"查询条件: 天气={params['weather']}, 位置={params['location']}")
+    print(f"查询条件: 天气={params['weather']}")
+    if location:
+        params["location"] = location
+        print(f"查询条件: 位置={params['location']}")
     
     try:
         response = requests.get(f"{BASE_URL}/frames/query", params=params)
@@ -465,10 +477,10 @@ def test_combined_query():
     print_separator("测试11: 组合查询（时间+车次+标签）")
     
     params = {
-        "start_time": "2025-02-14T00:00:00",
-        "end_time": "2025-02-14T23:59:59",
-        "train_no": "G4926",
-        "weather": "晴天",
+        "start_time": "2025-06-16T12:30:08",
+        "end_time": "2025-06-16T12:30:10",
+        "train_no": "G6126",
+        # "weather": "晴天",
         "limit": 20,
         "offset": 0
     }
@@ -476,7 +488,7 @@ def test_combined_query():
     print(f"查询条件:")
     print(f"  时间: {params['start_time']} ~ {params['end_time']}")
     print(f"  车次: {params['train_no']}")
-    print(f"  天气: {params['weather']}")
+    # print(f"  天气: {params['weather']}")
     
     try:
         response = requests.get(f"{BASE_URL}/frames/query", params=params)
@@ -529,6 +541,7 @@ def test_get_stats():
 # ============================================================================
 # 新增测试: /videos/<id>/image-at?t=...（含 seed 修复）
 # ============================================================================
+'''
 def test_video_image_at(video_id, seed_video_id=None, t_list=None):
     print_separator("新增测试: /videos/<id>/image-at")
     if not t_list:
@@ -550,6 +563,7 @@ def test_video_image_at(video_id, seed_video_id=None, t_list=None):
             print_response(resp)
     print(f"image-at 成功: {ok}/{len(t_list)} -> 输出目录: {out_dir}")
     return ok == len(t_list)
+'''
 # ============================================================================
 # 主测试流程
 # ============================================================================
@@ -571,9 +585,9 @@ def run_all_tests():
         return
     
     # 执行测试
-    video_id = None
+    # video_id = None
     
-    # 1. 上传视频
+    # # 1. 上传视频
     video_path = "/data/chenjuntao/OtherProj/dataManage/test_wrong.MP4"
     video_id = test_upload_video(video_path=video_path)
     if not video_id:
@@ -582,16 +596,17 @@ def run_all_tests():
         if videos:
             video_id = videos[0]['id']
             print(f"使用现有视频 ID: {video_id}")
-    
     time.sleep(1)
-    
+
     # 2. 获取视频列表
     test_get_videos()
+    # video_id = test_get_videos()['data'][0]['id']
     time.sleep(1)
     
     if video_id:
         # 3. 视频抽帧
-        if test_extract_frames(video_id):
+        # 设置 force_reprocess=True 可以在debug时强制重新抽帧
+        if test_extract_frames(video_id, force_reprocess=False):
             time.sleep(2)
             
             # 4. AI处理
@@ -606,43 +621,41 @@ def run_all_tests():
                 # 新增：按需抽帧（单帧）
                 run_dir = os.path.join(TEST_OUT_ROOT, time.strftime("%Y%m%d_%H%M%S"))
                 os.makedirs(run_dir, exist_ok=True)
-                test_on_demand_frame_images(frames, run_dir)
-                time.sleep(1)
-                # 新增：批量按需抽帧（ZIP）
-                test_batch_on_demand_images(frames, run_dir)
-                time.sleep(1)
+                # test_on_demand_frame_images(frames, run_dir)
+                # time.sleep(1)
+                # # 新增：批量按需抽帧（ZIP）
+                # test_batch_on_demand_images(frames, run_dir)
+                # time.sleep(1)
                 # 新增：条件检索 + 直接按需抽帧
                 test_condition_query_and_extract(run_dir)
             time.sleep(1)
 
-    # 针对“raw h264 伪装成 MP4”的文件，演示 /image-at 的 seed 修复能力
-    # try:
-    #     # 假设第2个视频是raw h264（刚刚注册），第1个是正常MP4，可作为seed
-    #     videos = test_get_videos()
-    #     if len(videos) >= 2:
-    #         vid_raw = videos[0]['id'] if videos[0]['width'] == 0 else videos[1]['id']
-    #         vid_seed = videos[1]['id'] if videos[0]['width'] == 0 else videos[0]['id']
-    #         print(f"尝试对视频 {vid_raw} 使用 seed={vid_seed} 进行 image-at 抽帧")
-    #         test_video_image_at(vid_raw, seed_video_id=vid_seed, t_list=[0.0, 1.0, 2.0])
-    # except Exception as _:
-    #     pass
     # exit()
-
     # 6-11. 各种查询测试
-    test_query_by_time_range()
+    test_query_by_time_range(
+        start_time="2025-06-16T12:30:58",
+        end_time="2025-06-16T12:31:11"
+    )
     time.sleep(1)
     
-    test_query_by_train()
+    test_query_by_train(
+        train_no="G6126"
+    )
     time.sleep(1)
     
-    test_query_by_route()
+    test_query_by_route(
+        route_section="佛山西-宜宾"
+    )
     time.sleep(1)
     
-    test_query_by_labels()
+    test_query_by_labels(
+        weather="雨天",
+    )
+    test_query_by_labels(weather="晴天")
     time.sleep(1)
     
-    test_ocr_search()
-    time.sleep(1)
+    # test_ocr_search()
+    # time.sleep(1)
     
     test_combined_query()
     time.sleep(1)

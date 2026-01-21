@@ -6,7 +6,7 @@ import sqlite3
 import json
 import hashlib
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 import os
 import sys
 import time
@@ -321,6 +321,26 @@ class VideoDatabase:
                     cursor.execute("ALTER TABLE frames ADD COLUMN frame_pts INTEGER")
                 except Exception:
                     pass
+
+            # 数据修复（幂等）：
+            # 历史版本在 ffmpeg 抽帧时会先落到 output_dir/.tmp_ffmpeg，
+            # 但入库时把 image_path 写成了临时目录路径，随后临时目录会被迁移/删除，
+            # 导致数据库留存的 image_path 指向不存在的位置。
+            try:
+                cursor.execute(
+                    "UPDATE frames "
+                    "SET image_path = REPLACE(image_path, '/.tmp_ffmpeg', '') "
+                    "WHERE image_path LIKE '%/.tmp_ffmpeg/%'"
+                )
+                try:
+                    fixed_cnt = int(cursor.rowcount or 0)
+                except Exception:
+                    fixed_cnt = 0
+                if fixed_cnt > 0:
+                    print(f"🛠️ 已修复历史 frames.image_path 临时目录路径: {fixed_cnt} 条")
+            except Exception:
+                # 不中断迁移流程
+                pass
 
             conn.commit()
             print("✅ 数据库迁移检查完成")
@@ -671,6 +691,116 @@ class VideoDatabase:
         frames = [dict(row) for row in cursor.fetchall()]
         self.close_conn()
         return frames
+
+    def get_frame_idx_sets(self, video_id: int) -> Tuple[Set[int], Set[int]]:
+        """
+        获取某个视频的帧索引集合：
+        - existing_frame_idxs：该视频在 frames 表里出现过的 frame_idx（去重）
+        - processed_frame_idxs：其中 ai_processed=1 的 frame_idx（去重）
+        """
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT frame_idx, MAX(ai_processed) AS processed "
+                "FROM frames "
+                "WHERE video_id = ? "
+                "GROUP BY frame_idx",
+                (video_id,)
+            )
+            existing: Set[int] = set()
+            processed: Set[int] = set()
+            for row in cursor.fetchall():
+                idx = int(row["frame_idx"])
+                existing.add(idx)
+                if int(row["processed"] or 0) == 1:
+                    processed.add(idx)
+            return existing, processed
+        finally:
+            self.close_conn()
+
+    def cleanup_processed_frame_images(self, video_id: int = None, clear_image_path: bool = True) -> Dict:
+        """
+        清理已完成 AI 处理（ai_processed=1）的帧图片文件。
+        
+        删除条件：
+        - ai_processed = 1
+        - image_path 非空
+        - (可选) 限定 video_id
+        
+        Args:
+            video_id: 可选，仅清理某个视频的帧图片
+            clear_image_path: 删除后是否将对应 frames.image_path 置空（避免前端误用）
+        
+        Returns:
+            {'scanned': int, 'removed': int, 'missing': int, 'failed': int, 'cleared': int}
+        """
+        def _cleanup():
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            
+            conditions = [
+                "ai_processed = 1",
+                "image_path IS NOT NULL",
+                "TRIM(image_path) != ''",
+            ]
+            params: List = []
+            if video_id is not None:
+                conditions.append("video_id = ?")
+                params.append(video_id)
+            
+            where_clause = " AND ".join(conditions)
+            cursor.execute(f"SELECT id, image_path FROM frames WHERE {where_clause}", params)
+            rows = cursor.fetchall()
+            
+            scanned = len(rows)
+            removed = 0
+            missing = 0
+            failed = 0
+            ids_to_clear: List[int] = []
+            
+            for r in rows:
+                fid = r["id"]
+                p = (r["image_path"] or "").strip()
+                if not p:
+                    continue
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                        removed += 1
+                        if clear_image_path:
+                            ids_to_clear.append(fid)
+                    else:
+                        # 不存在或不是文件（例如已被清理）
+                        missing += 1
+                        if clear_image_path:
+                            ids_to_clear.append(fid)
+                except Exception:
+                    failed += 1
+            
+            cleared = 0
+            if clear_image_path and ids_to_clear:
+                # 分批更新，避免 SQLite 变量上限（默认 999）
+                chunk_size = 500
+                for i in range(0, len(ids_to_clear), chunk_size):
+                    chunk = ids_to_clear[i:i + chunk_size]
+                    placeholders = ",".join(["?"] * len(chunk))
+                    cursor.execute(
+                        f"UPDATE frames SET image_path = '' WHERE id IN ({placeholders})",
+                        chunk
+                    )
+                conn.commit()
+                cleared = len(ids_to_clear)
+            
+            return {
+                'scanned': scanned,
+                'removed': removed,
+                'missing': missing,
+                'failed': failed,
+                'cleared': cleared
+            }
+        
+        return self.execute_with_retry(_cleanup)
     
     # ==================== 高级查询 ====================
     

@@ -27,7 +27,8 @@ SAM_MODEL_TYPE = 'vit_b'
 SAM_DEVICE = 'cuda'
 
 # 分类模型配置
-CLASSIFIER_CHECKPOINT = os.path.join(BASE_DIR, 'ai_models', 'classifier', 'best_resnet50_scene.pth')
+# CLASSIFIER_CHECKPOINT = os.path.join(BASE_DIR, 'ai_models', 'classifier', 'best_resnet50_scene.pth')
+CLASSIFIER_CHECKPOINT = os.getenv("CLASSIFIER_CHECKPOINT", "/data1/zhanglu/zgzc/Scene_classification/best_resnet50_scene.pth")
 CLASSIFIER_NUM_CLASSES = 8
 CLASSIFIER_CLASS_NAMES = [
     "穿过高架桥",
@@ -39,6 +40,12 @@ CLASSIFIER_CLASS_NAMES = [
     "暴雨",
     "太阳光直射弓头"  # 第8类
 ]
+
+# 推理设备配置
+# - OCR_DEVICE: PaddlePaddle 设备字符串，如 "gpu:0" / "gpu:5" / "cpu"
+# - CLASSIFIER_DEVICE: PyTorch 设备字符串，如 "cuda:0" / "cuda:5" / "cpu" / "auto"
+OCR_DEVICE = os.getenv("OCR_DEVICE", "gpu:5")
+CLASSIFIER_DEVICE = os.getenv("CLASSIFIER_DEVICE", "cuda:5")
 
 # 服务器配置
 HOST = '0.0.0.0'

@@ -8,7 +8,7 @@ import imageio
 import subprocess
 import shutil
 from imageio_ffmpeg import get_ffmpeg_exe
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Set
 from datetime import datetime
 import sys
 import re
@@ -119,7 +119,7 @@ class VideoFrameExtractor:
     
     def extract_frames(self, video_path: str, video_id: int = None,
                       max_frames: int = None, sample_rate: int = None,
-                      save_to_db: bool = True) -> Dict:
+                      save_to_db: bool = True, force_reprocess: bool = False) -> Dict:
         """
         提取视频帧
         
@@ -129,6 +129,7 @@ class VideoFrameExtractor:
             max_frames: 最大提取帧数（超过则等间隔采样）
             sample_rate: 采样率（每N帧提取1帧， 会覆盖上一个参数）
             save_to_db: 是否保存到数据库
+            force_reprocess: 强制重新处理，跳过ai_processed检查（用于debug）
         
         Returns:
             {
@@ -177,29 +178,9 @@ class VideoFrameExtractor:
             # 3. 确定输出目录
             video_name = os.path.splitext(os.path.basename(video_path))[0]
             output_dir = os.path.join(self.output_base_dir, str(video_id), video_name)
-            
-            # 如果目录存在且不为空，检查是否需要重新提取
-            if os.path.exists(output_dir) and os.listdir(output_dir):
-                existing_frames = len([f for f in os.listdir(output_dir) if f.endswith('.jpg')])
-                print(f"   ⚠️  输出目录已存在 {existing_frames} 个帧，跳过提取")
-                
-                if save_to_db:
-                    video_db.update_video(video_id, status='extracted')
-                
-                clean_dir(output_dir)
 
-                return {
-                    'success': True,
-                    'video_id': video_id,
-                    'extracted_frames': existing_frames,
-                    'output_dir': output_dir,
-                    'skipped': True
-                }
-            
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 4. 计算采样策略
-            total_frames = metadata['total_frames']
+            # 4. 计算采样策略（决定“理论上应有多少帧”）
+            total_frames = int(metadata.get('total_frames') or 0)
             
             if sample_rate:
                 # 手动指定采样率
@@ -216,21 +197,74 @@ class VideoFrameExtractor:
                 sample_interval = 1
                 estimated_output = total_frames
                 print(f"   策略: 提取所有 {total_frames} 帧")
+
+            # 5. 判断是否可以跳过：
+            # 旧逻辑只看 output_dir 下是否有图片文件，会在“已AI处理并清理图片后”误触发重新抽帧/重复入库。
+            # 新逻辑基于 frames 表（ai_processed）判断抽帧是否已完整闭环。
+            existing_frame_idxs: Set[int] = set()
+            processed_frame_idxs: Set[int] = set()
+            if save_to_db and video_id is not None:
+                try:
+                    existing_frame_idxs, processed_frame_idxs = video_db.get_frame_idx_sets(video_id)
+                except Exception as _e:
+                    # 不影响主流程：出现异常则退化为“继续抽帧”
+                    existing_frame_idxs, processed_frame_idxs = set(), set()
+
+            expected_frame_idxs: Set[int] = set()
+            if total_frames > 0 and sample_interval > 0:
+                expected_frame_idxs = set(range(0, total_frames, sample_interval))
+
+            # 跳过条件：
+            # - 如果可计算 expected_frame_idxs：本次采样策略对应的帧均已 ai_processed=1，则认为已闭环，跳过抽帧
+            # - 如果无法计算 expected_frame_idxs（极少数元数据缺失）：退化为“库里所有帧均已处理”才跳过
+            skip_ok = False
+            if not force_reprocess:
+                if expected_frame_idxs:
+                    if expected_frame_idxs.issubset(processed_frame_idxs):
+                        skip_ok = True
+                else:
+                    if existing_frame_idxs and (existing_frame_idxs == processed_frame_idxs):
+                        skip_ok = True
+            else:
+                print(f"   🔧 force_reprocess=True，强制重新抽帧")
+                # 强制抽帧前先清空目标目录
+                if os.path.exists(output_dir):
+                    shutil.rmtree(output_dir)
+                os.makedirs(output_dir, exist_ok=True)
+
+            if skip_ok:
+                hit = len(expected_frame_idxs.intersection(processed_frame_idxs)) if expected_frame_idxs else len(processed_frame_idxs)
+                exp = len(expected_frame_idxs) if expected_frame_idxs else len(existing_frame_idxs)
+                print(f"   ✅ frames库已完成AI处理（expected={exp}, processed_hit={hit}），跳过抽帧")
+                if save_to_db:
+                    video_db.update_video(video_id, status='extracted')
+                return {
+                    'success': True,
+                    'video_id': video_id,
+                    'extracted_frames': exp,
+                    'output_dir': output_dir,
+                    'skipped': True,
+                    'skip_reason': 'all_frames_ai_processed'
+                }
+
+            os.makedirs(output_dir, exist_ok=True)
             
-            # 5. 开始提取（优先 ffmpeg 带 -frame_pts 以便记录精确 PTS；失败再回退 imageio）
+            # 6. 开始提取（优先 ffmpeg 带 -frame_pts 以便记录精确 PTS；失败再回退 imageio）
             try:
                 extracted_frames = self._extract_with_ffmpeg_cli_pts(
                     video_path, output_dir, video_id, sample_interval,
-                    metadata['fps'], save_to_db
+                    metadata['fps'], save_to_db,
+                    existing_frame_idxs=existing_frame_idxs
                 )
             except Exception as e_ff:
                 print(f"⚠️  ffmpeg PTS 提取失败，尝试使用 imageio 回退: {e_ff}")
                 extracted_frames = self._extract_with_imageio(
                     video_path, output_dir, video_id, sample_interval,
-                    metadata['fps'], save_to_db
+                    metadata['fps'], save_to_db,
+                    existing_frame_idxs=existing_frame_idxs
                 )
             
-            # 6. 更新状态
+            # 7. 更新状态
             if save_to_db:
                 video_db.update_video(video_id, status='extracted')
                 
@@ -251,7 +285,7 @@ class VideoFrameExtractor:
             print(f"✅ 提取完成: {extracted_frames} 帧，用时 {(datetime.now() - start_time).total_seconds():.2f}s")
             
             # 清理output_dir，仅保留文件夹本身
-            clean_dir(output_dir)
+            # clean_dir(output_dir)
 
             return {
                 'success': True,
@@ -276,7 +310,7 @@ class VideoFrameExtractor:
                     duration_sec=duration
                 )
             
-            clean_dir(output_dir)
+            # clean_dir(output_dir)
 
             return {
                 'success': False,
@@ -286,7 +320,8 @@ class VideoFrameExtractor:
     
     def _extract_with_imageio(self, video_path: str, output_dir: str,
                              video_id: int, sample_interval: int,
-                             fps: float, save_to_db: bool) -> int:
+                             fps: float, save_to_db: bool,
+                             existing_frame_idxs: Set[int] = None) -> int:
         """使用imageio提取帧（更稳定）"""
         reader = imageio.get_reader(video_path)
         
@@ -302,17 +337,21 @@ class VideoFrameExtractor:
         for frame in reader:
             # 根据采样间隔决定是否保存
             if frame_idx % sample_interval == 0:
-                # 保存图片
-                image_filename = f"frame_{extracted_count:06d}.jpg"
+                should_insert = True
+                if save_to_db and existing_frame_idxs and frame_idx in existing_frame_idxs:
+                    should_insert = False
+                # 保存图片，统一使用 frame_idx 作为文件名
+                image_filename = f"frame_{frame_idx:08d}.jpg"
                 image_path = os.path.join(output_dir, image_filename)
                 imageio.imwrite(image_path, frame)
-                uncommitted_paths.append(image_path)
+                if save_to_db and should_insert:
+                    uncommitted_paths.append(image_path)
                 
                 # 计算时间戳（毫秒）
                 pts_ms = int((frame_idx / fps) * 1000) if fps > 0 else frame_idx * 40
                 
                 # 添加到数据库（批量）
-                if save_to_db:
+                if save_to_db and should_insert:
                     frames_buffer.append({
                         'video_id': video_id,
                         'frame_idx': frame_idx,
@@ -368,7 +407,8 @@ class VideoFrameExtractor:
     
     def _extract_with_ffmpeg_cli_pts(self, video_path: str, output_dir: str,
                                      video_id: int, sample_interval: int,
-                                     fps: float, save_to_db: bool) -> int:
+                                     fps: float, save_to_db: bool,
+                                     existing_frame_idxs: Set[int] = None) -> int:
         """
         使用 imageio-ffmpeg 提供的 ffmpeg 抽帧：
         - 启用 -frame_pts 1，使文件名包含帧 PTS 以便精确索引
@@ -405,9 +445,14 @@ class VideoFrameExtractor:
         buffer_size = 100
         
         for i, fname in enumerate(files):
-            image_path = os.path.join(tmp_dir, fname)
+            # 注意：磁盘上先落到 tmp_dir，入库时写“最终目标路径”（output_dir），
+            # 避免后续迁移/清理临时目录后数据库里留的还是临时路径。
+            tmp_image_path = os.path.join(tmp_dir, fname)
             # 估算原始帧序号（按间隔）
             frame_idx = i * (sample_interval if sample_interval else 1)
+            # 统一命名：使用 frame_idx 作为文件名（8位数，如 frame_00000000.jpg）
+            new_filename = f"frame_{frame_idx:08d}.jpg"
+            final_image_path = os.path.join(output_dir, new_filename)
             # 从文件名解析 PTS 并换算 ms： ms = pts * num/den * 1000
             m = re.match(r"frame_(\d+)\.jpg$", fname)
             frame_pts = int(m.group(1)) if m else None
@@ -417,12 +462,15 @@ class VideoFrameExtractor:
                 pts_ms = int((frame_idx / fps) * 1000) if fps and fps > 0 else frame_idx * 40
             
             if save_to_db:
+                if existing_frame_idxs and frame_idx in existing_frame_idxs:
+                    extracted_count += 1
+                    continue
                 frames_buffer.append({
                     'video_id': video_id,
                     'frame_idx': frame_idx,
                     'pts_ms': pts_ms,
                     'frame_pts': frame_pts,
-                    'image_path': image_path
+                    'image_path': final_image_path
                 })
                 if len(frames_buffer) >= buffer_size:
                     try:
@@ -449,11 +497,13 @@ class VideoFrameExtractor:
                     pass
                 raise
         
-        # 入库成功后再将临时文件迁移到最终目录
+        # 入库成功后再将临时文件迁移到最终目录，并重命名为统一格式
         try:
-            for fname in files:
+            for i, fname in enumerate(files):
+                frame_idx = i * (sample_interval if sample_interval else 1)
+                new_filename = f"frame_{frame_idx:08d}.jpg"
                 src = os.path.join(tmp_dir, fname)
-                dst = os.path.join(output_dir, fname)
+                dst = os.path.join(output_dir, new_filename)
                 # 使用原子移动（同分区快速）
                 shutil.move(src, dst)
             # 清理空临时目录

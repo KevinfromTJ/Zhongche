@@ -18,9 +18,20 @@ def get_classifier():
     if _classifier_model is None:
         print("正在加载分类模型...")
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from config import CLASSIFIER_CHECKPOINT, CLASSIFIER_NUM_CLASSES
-        
-        _classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from config import CLASSIFIER_CHECKPOINT, CLASSIFIER_NUM_CLASSES, CLASSIFIER_DEVICE
+
+        # 指定分类模型推理设备（可在 config.py / 环境变量 CLASSIFIER_DEVICE 中配置）
+        device_str = (CLASSIFIER_DEVICE or "auto")
+        if str(device_str).lower() in ("auto",):
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        if str(device_str).startswith("cuda") and (not torch.cuda.is_available()):
+            print(f"⚠️ CLASSIFIER_DEVICE={device_str} 但当前无CUDA可用，回退cpu")
+            device_str = "cpu"
+        try:
+            _classifier_device = torch.device(device_str)
+        except Exception as e:
+            print(f"⚠️ 分类设备设置失败({device_str})，回退cpu: {e}")
+            _classifier_device = torch.device("cpu")
         
         # 加载模型
         _classifier_model = models.resnet50(weights=None)

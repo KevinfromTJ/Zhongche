@@ -25,9 +25,20 @@ def get_classifier():
     
     if _classifier_model is None:
         print("正在加载分类模型 (ResNet50)...")
-        from config import CLASSIFIER_CHECKPOINT, CLASSIFIER_NUM_CLASSES
-        
-        _classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from config import CLASSIFIER_CHECKPOINT, CLASSIFIER_NUM_CLASSES, CLASSIFIER_DEVICE
+
+        # 指定分类模型推理设备（可在 config.py / 环境变量 CLASSIFIER_DEVICE 中配置）
+        device_str = (CLASSIFIER_DEVICE or "auto")
+        if str(device_str).lower() in ("auto",):
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        if str(device_str).startswith("cuda") and (not torch.cuda.is_available()):
+            print(f"⚠️ CLASSIFIER_DEVICE={device_str} 但当前无CUDA可用，回退cpu")
+            device_str = "cpu"
+        try:
+            _classifier_device = torch.device(device_str)
+        except Exception as e:
+            print(f"⚠️ 分类设备设置失败({device_str})，回退cpu: {e}")
+            _classifier_device = torch.device("cpu")
         print(f"  使用设备: {_classifier_device}")
         
         # 加载模型
@@ -114,7 +125,7 @@ class VideoClassifierService:
         """
         # 调用 ResNet50 模型
         class_idx, class_name, confidence, all_probs = predict_image(image_path)
-        
+        print(f"frame_idx: {frame_idx}, class_name: {class_name}")
         # 将分类结果映射到多维度标签
         weather = self.class_to_weather.get(class_name, None)
         location = self.class_to_location.get(class_name, None)

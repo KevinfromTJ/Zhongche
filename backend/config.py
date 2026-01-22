@@ -42,10 +42,24 @@ CLASSIFIER_CLASS_NAMES = [
 ]
 
 # 推理设备配置
-# - OCR_DEVICE: PaddlePaddle 设备字符串，如 "gpu:0" / "gpu:5" / "cpu"
-# - CLASSIFIER_DEVICE: PyTorch 设备字符串，如 "cuda:0" / "cuda:5" / "cpu" / "auto"
-OCR_DEVICE = os.getenv("OCR_DEVICE", "gpu:5")
-CLASSIFIER_DEVICE = os.getenv("CLASSIFIER_DEVICE", "cuda:5")
+# - OCR_DEVICE_IDS: OCR使用的GPU ID列表，如 "0,1,2" 表示使用GPU 0,1,2
+# - CLASSIFIER_DEVICE_IDS: 分类器使用的GPU ID列表，如 "0,1" 表示使用GPU 0,1
+# - OCR_INSTANCES_PER_GPU: 每张GPU上启动的OCR实例数量
+# - CLASSIFIER_BATCH_SIZE: 分类器单次批处理大小
+OCR_DEVICE_IDS = os.getenv("OCR_DEVICE_IDS", "4,5").split(",")  # 默认使用GPU 5
+CLASSIFIER_DEVICE_IDS = os.getenv("CLASSIFIER_DEVICE_IDS", "0").split(",")  # 最好和OCR分开放
+OCR_INSTANCES_PER_GPU = int(os.getenv("OCR_INSTANCES_PER_GPU", "4"))  # 每张GPU上的OCR实例数 4差不多了
+CLASSIFIER_BATCH_SIZE = int(os.getenv("CLASSIFIER_BATCH_SIZE", "32"))  # 分类器batch大小 32-64差不多了
+
+# 兼容旧配置（单设备）
+OCR_DEVICE = os.getenv("OCR_DEVICE", f"gpu:{OCR_DEVICE_IDS[0]}")
+CLASSIFIER_DEVICE = os.getenv("CLASSIFIER_DEVICE", f"cuda:{CLASSIFIER_DEVICE_IDS[0]}")
+
+# OCR模型配置
+OCR_DET_MODEL_PATH = os.getenv("OCR_DET_MODEL_PATH", None)  # None表示使用默认模型名
+OCR_REC_MODEL_PATH = os.getenv("OCR_REC_MODEL_PATH", None)  # None表示使用默认模型名
+OCR_DET_MODEL_NAME = os.getenv("OCR_DET_MODEL_NAME", "PP-OCRv5_server_det")  # 检测模型名称
+OCR_REC_MODEL_NAME = os.getenv("OCR_REC_MODEL_NAME", "PP-OCRv5_server_rec")  # 识别模型名称
 
 # 服务器配置
 HOST = '0.0.0.0'

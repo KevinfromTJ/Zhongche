@@ -1,113 +1,232 @@
 """
 视频OCR服务
 调用 PaddleOCR (PP-OCRv5_server) 识别图片中的文字
+支持多进程并行推理（绕过Python GIL限制）
+
+性能说明：
+- PaddleOCR 本身不支持真正的batch推理，每张图片单独处理
+- Python的GIL限制了多线程的真正并行
+- 解决方案：使用多进程（multiprocessing）实现真正并行
+- 每个进程独立加载OCR模型，在不同GPU上运行
 """
 import os
 import sys
 import re
-from typing import Dict, List
+import glob
+from typing import Dict, List, Tuple
+import time
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 全局变量
-_ocr_model = None
+# 全局变量：OCR实例（进程内单例）
+_ocr_instance = None
+_ocr_instance_lock = threading.Lock()
 
 
-def get_ocr():
-    """获取OCR模型（单例模式）"""
-    global _ocr_model
+def _get_ocr_config():
+    """获取OCR配置"""
+    from config import (OCR_DET_MODEL_PATH, OCR_REC_MODEL_PATH,
+                        OCR_DET_MODEL_NAME, OCR_REC_MODEL_NAME)
+    return {
+        'det_path': OCR_DET_MODEL_PATH,
+        'rec_path': OCR_REC_MODEL_PATH,
+        'det_name': OCR_DET_MODEL_NAME,
+        'rec_name': OCR_REC_MODEL_NAME,
+    }
+
+
+def _create_ocr_instance(gpu_id: str):
+    """创建OCR实例"""
+    from paddleocr import PaddleOCR
+    config = _get_ocr_config()
     
-    if _ocr_model is None:
-        print("正在加载OCR模型 (PP-OCRv5_server)...")
-        # 指定 OCR 推理设备（可在 config.py / 环境变量 OCR_DEVICE 中配置）
+    device = f"gpu:{gpu_id}"
+    
+    # 构建模型参数
+    ocr_kwargs = {
+        'use_doc_orientation_classify': False,
+        'use_doc_unwarping': False,
+        'use_textline_orientation': False,
+        'device': device,
+    }
+    
+    # 优先使用路径配置，其次使用模型名称
+    if config['det_path'] and os.path.exists(config['det_path']):
+        ocr_kwargs['text_detection_model_dir'] = config['det_path']
+    else:
+        ocr_kwargs['text_detection_model_name'] = config['det_name']
+    
+    if config['rec_path'] and os.path.exists(config['rec_path']):
+        ocr_kwargs['text_recognition_model_dir'] = config['rec_path']
+    else:
+        ocr_kwargs['text_recognition_model_name'] = config['rec_name']
+    
+    return PaddleOCR(**ocr_kwargs)
+
+
+def get_ocr(device_id="0"):
+    """获取OCR模型实例（进程内单例）"""
+    global _ocr_instance
+    
+    with _ocr_instance_lock:
+        if _ocr_instance is None:
+            print(f"正在加载OCR模型 on gpu:{device_id}...")
+            _ocr_instance = _create_ocr_instance(device_id)
+            print("OCR模型加载完成")
+        return _ocr_instance
+
+
+def _parse_ocr_result(result) -> List[Dict]:
+    """解析OCR结果"""
+    if not result:
+        return []
+    
+    recognized_items = []
+    for page in result:
+        det_polys = page.get("rec_polys", [])
+        rec_texts = page.get("rec_texts", [])
+        rec_scores = page.get("rec_scores", [])
+        
+        for i in range(len(det_polys)):
+            recognized_items.append({
+                'box': det_polys[i],
+                'text': rec_texts[i],
+                'confidence': float(rec_scores[i]) if rec_scores[i] else 1.0
+            })
+    
+    return recognized_items
+
+
+def _process_worker_init(gpu_id: str):
+    """进程初始化函数：在工作进程中预加载OCR模型"""
+    global _ocr_instance
+    # 设置CUDA可见设备，限制此进程只能看到指定的GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
+    print(f"[PID:{os.getpid()}] 初始化OCR工作进程，GPU={gpu_id}")
+    # 预加载模型（会在第一次predict时自动使用gpu:0，因为CUDA_VISIBLE_DEVICES的映射）
+    _ocr_instance = _create_ocr_instance("0")  # 使用0因为CUDA_VISIBLE_DEVICES映射后只有一个GPU可见
+    print(f"[PID:{os.getpid()}] OCR模型加载完成")
+
+
+def _process_single_image(image_path: str) -> Tuple[str, List[Dict]]:
+    """处理单张图片（在工作进程中执行）"""
+    global _ocr_instance
+    
+    if not os.path.exists(image_path):
+        return (image_path, [])
+    
+    try:
+        result = _ocr_instance.predict(image_path)
+        items = _parse_ocr_result(result)
+        return (image_path, items)
+    except Exception as e:
+        print(f"⚠️ OCR处理失败 {image_path}: {e}")
+        return (image_path, [])
+
+
+# ============ 多进程池管理 ============
+_process_pools = {}  # gpu_id -> ProcessPoolExecutor
+_pools_lock = threading.Lock()
+
+
+def _get_or_create_process_pool(gpu_id: str, workers_per_gpu: int) -> ProcessPoolExecutor:
+    """获取或创建指定GPU的进程池"""
+    global _process_pools
+    
+    with _pools_lock:
+        if gpu_id not in _process_pools:
+            print(f"🔧 创建GPU {gpu_id} 的进程池，工作进程数={workers_per_gpu}")
+            # 使用spawn方式创建进程，避免CUDA上下文问题
+            ctx = mp.get_context('spawn')
+            pool = ProcessPoolExecutor(
+                max_workers=workers_per_gpu,
+                mp_context=ctx,
+                initializer=_process_worker_init,
+                initargs=(gpu_id,)
+            )
+            _process_pools[gpu_id] = pool
+        return _process_pools[gpu_id]
+
+
+def parallel_recognize_text(image_paths: List[str]) -> Dict[str, List[Dict]]:
+    """
+    多进程并行OCR识别（真正绕过GIL）
+    
+    使用多进程池，每个GPU一个进程池，进程数由OCR_INSTANCES_PER_GPU配置
+    
+    Args:
+        image_paths: 图片路径列表
+    
+    Returns:
+        {image_path: recognized_items} 的字典
+    """
+    if not image_paths:
+        return {}
+    
+    from config import OCR_DEVICE_IDS, OCR_INSTANCES_PER_GPU
+    
+    gpu_ids = [g.strip() for g in OCR_DEVICE_IDS]
+    num_gpus = len(gpu_ids)
+    
+    if num_gpus == 0:
+        print("⚠️ 没有配置OCR GPU")
+        return {}
+    
+    # 将图片均分到各个GPU
+    gpu_tasks = {gpu_id: [] for gpu_id in gpu_ids}
+    for i, img_path in enumerate(image_paths):
+        gpu_id = gpu_ids[i % num_gpus]
+        gpu_tasks[gpu_id].append(img_path)
+    
+    results = {}
+    all_futures = []
+    
+    # 为每个GPU提交任务
+    for gpu_id, tasks in gpu_tasks.items():
+        if not tasks:
+            continue
+        
+        pool = _get_or_create_process_pool(gpu_id, OCR_INSTANCES_PER_GPU)
+        
+        # 提交任务到进程池
+        for img_path in tasks:
+            future = pool.submit(_process_single_image, img_path)
+            all_futures.append((future, gpu_id))
+    
+    # 收集结果
+    for future, gpu_id in all_futures:
         try:
-            from config import OCR_DEVICE
-        except Exception:
-            OCR_DEVICE = "gpu:0"
-        try:
-            import paddle
-            try:
-                paddle.set_device(OCR_DEVICE)
-                print(f"  OCR设备: {OCR_DEVICE}")
-            except Exception as e:
-                print(f"⚠️ OCR设备设置失败({OCR_DEVICE})，回退cpu: {e}")
-                try:
-                    paddle.set_device("cpu")
-                except Exception:
-                    pass
+            img_path, items = future.result(timeout=60)  # 60秒超时
+            results[img_path] = items
         except Exception as e:
-            print(f"⚠️ Paddle导入失败，OCR将使用默认设备: {e}")
-        from paddleocr import PaddleOCR
-        
-        _ocr_model = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_server_det",
-            text_recognition_model_name="PP-OCRv5_server_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
-        
-        print("OCR模型加载完成")
+            print(f"⚠️ GPU {gpu_id} OCR任务失败: {e}")
     
-    return _ocr_model
+    return results
 
 
 def recognize_text(image_path):
     """
-    识别图片中的文字
+    识别单张图片中的文字
     
     Args:
         image_path: 图片路径
     
     Returns:
-        results: 识别结果列表，每个元素包含：
-            - box: 文本框坐标
-            - text: 识别的文字
-            - confidence: 置信度（如果有）
+        results: 识别结果列表
     """
-    ocr = get_ocr()
-    
-    assert os.path.exists(image_path), f"图片不存在: {image_path}"
-    # 使用 predict 方法
-    # image_path="https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/general_ocr_002.png"
-    result = ocr.predict(image_path)
-    # print(result)
-    # result = result[0]
-    # print(result)
-    if not result:
+    if not os.path.exists(image_path):
+        print(f"⚠️ OCR图片不存在: {image_path}")
         return []
     
-    recognized_items = []
-
-    for page in result:
-        det_polys = page["rec_polys"]
-        rec_texts = page["rec_texts"]
-        rec_scores = page["rec_scores"]
-        # print(det_polys, rec_texts, rec_scores)
-        for i in range(len(det_polys)):
-            bbox = det_polys[i]         # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-            text = rec_texts[i]         # 识别出的文本
-            score = rec_scores[i]       # 置信度得分
-
-            recognized_items.append({
-                'box': bbox,
-                'text': text,
-                'confidence': float(score) if score else 1.0
-            })
+    from config import OCR_DEVICE_IDS
+    gpu_id = OCR_DEVICE_IDS[0].strip() if OCR_DEVICE_IDS else "0"
     
-    # for res in result:
-    #     if isinstance(res, dict):
-    #         text = res.get('text', '')
-    #         box = res.get('box', [])
-    #         confidence = res.get('confidence', res.get('score', 1.0))  # 尝试获取置信度
-            
-    #         recognized_items.append({
-    #             'box': box,
-    #             'text': text,
-    #             'confidence': float(confidence) if confidence else 1.0
-    #         })
-    # print("--------------------------------")
-    return recognized_items
+    ocr = get_ocr(gpu_id)
+    result = ocr.predict(image_path)
+    return _parse_ocr_result(result)
 
 
 class VideoOCRService:
@@ -115,6 +234,23 @@ class VideoOCRService:
     
     def __init__(self):
         pass
+    
+    def _parse_ocr_items(self, ocr_items: List[Dict]) -> Dict:
+        """解析OCR识别结果"""
+        full_text = ' '.join([item['text'] for item in ocr_items])
+        avg_confidence = sum([item['confidence'] for item in ocr_items]) / len(ocr_items) if ocr_items else 0.0
+        
+        return {
+            'ocr_text': full_text,
+            'ocr_time': self._extract_time(full_text),
+            'ocr_train_no': self._extract_train_no(full_text),
+            'ocr_route_section': self._extract_route_section(full_text),
+            'ocr_car_no': self._extract_number(full_text, r'车厢号[:：]?\s*(\d+)'),
+            'ocr_pos_no': self._extract_number(full_text, r'位置号[:：]?\s*(\d+)'),
+            'ocr_speed': self._extract_float(full_text, r'速度[:：]?\s*(\d+\.?\d*)'),
+            'ocr_mileage': self._extract_float(full_text, r'里程[:：]?\s*[Zz]?(\d+\.?\d*)'),
+            'ocr_confidence': round(avg_confidence, 3)
+        }
     
     def extract_text(self, image_path: str, frame_idx: int = 0) -> Dict:
         """
@@ -127,29 +263,32 @@ class VideoOCRService:
         Returns:
             OCR结果字典
         """
-        # 调用 PaddleOCR 识别
         ocr_items = recognize_text(image_path)
+        return self._parse_ocr_items(ocr_items)
+    
+    def batch_extract_parallel(self, image_paths: List[str]) -> List[Dict]:
+        """
+        批量并行OCR提取（多实例并行）
         
-        # 拼接所有文本
-        full_text = ' '.join([item['text'] for item in ocr_items])
+        Args:
+            image_paths: 图片路径列表
         
-        # 计算平均置信度
-        avg_confidence = sum([item['confidence'] for item in ocr_items]) / len(ocr_items) if ocr_items else 0.0
+        Returns:
+            OCR结果列表，顺序与输入一致
+        """
+        if not image_paths:
+            return []
         
-        # 解析结构化信息（字段名与数据库一致）
-        ocr_result = {
-            'ocr_text': full_text,
-            'ocr_time': self._extract_time(full_text),
-            'ocr_train_no': self._extract_train_no(full_text),
-            'ocr_route_section': self._extract_route_section(full_text),
-            'ocr_car_no': self._extract_number(full_text, r'车厢号[:：]?\s*(\d+)'),
-            'ocr_pos_no': self._extract_number(full_text, r'位置号[:：]?\s*(\d+)'),
-            'ocr_speed': self._extract_float(full_text, r'速度[:：]?\s*(\d+\.?\d*)'),
-            'ocr_mileage': self._extract_float(full_text, r'里程[:：]?\s*[Zz]?(\d+\.?\d*)'),
-            'ocr_confidence': round(avg_confidence, 3)
-        }
+        # 使用多实例并行识别
+        ocr_results_dict = parallel_recognize_text(image_paths)
         
-        return ocr_result
+        # 按输入顺序返回结果
+        results = []
+        for img_path in image_paths:
+            ocr_items = ocr_results_dict.get(img_path, [])
+            results.append(self._parse_ocr_items(ocr_items))
+        
+        return results
     
     def _extract_time(self, text: str):
         """
@@ -314,18 +453,23 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         test_image = sys.argv[1]
     else:
-        test_image = "/data/chenjuntao/OtherProj/dataManage/ref_fengchen_251225/backend/data/video_frames/1/test_wrong/frame_540000.jpg"
+        # test_image = "/data/chenjuntao/OtherProj/dataManage/ref_fengchen_251225/backend/data/video_frames/1/test_wrong/frame_00000300.jpg"
+        # test_image = glob.glob("/data/chenjuntao/OtherProj/dataManage/ref_fengchen_251225/backend/data/video_frames/1/test_wrong/frame_*.jpg")
+
+        # print("抽取数量:", len(test_image))
+        test_image = "/data/chenjuntao/OtherProj/dataManage/6bd19657357ba82fa991df578e904cff.png"
     
-    if os.path.exists(test_image):
+    if test_image:  # os.path.exists(test_image):
         service = VideoOCRService()
-        result = service.extract_text(test_image, 0)
+        result = service.extract_text(test_image)
         print("\n=== OCR 结果 ===")
         for key, value in result.items():
             print(f"{key}: {value}")
     else:
         print(f"测试图片不存在: {test_image}")
         print("用法: python video_ocr_service.py <图片路径>")
-
+    # import time
+    # time.sleep(100)
         # Step 3: 测试 GPU OCR（仅在 Step 2 正常时进行）
 # if paddle.is_compiled_with_cuda():
 #     ocr_gpu = PaddleOCR(lang='ch')

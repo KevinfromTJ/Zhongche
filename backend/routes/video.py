@@ -196,6 +196,10 @@ def _extract_frames_background(video_path, video_id, max_frames, sample_rate, fo
         video_db.update_video(video_id, status='error', error_msg=str(e))
 
 
+# AI处理并发锁：限制同一时刻只有一个AI处理请求
+_ai_process_lock = threading.Lock()
+
+
 @video_bp.route('/videos/<int:video_id>/process-ai', methods=['POST'])
 def process_video_ai(video_id):
     """
@@ -204,6 +208,7 @@ def process_video_ai(video_id):
     JSON参数:
         async: 是否异步执行（默认False）
         batch_size: 批处理大小（默认50）
+        force_reprocess: 强制重新处理已处理的帧（默认False，用于debug）
     """
     video = video_db.get_video(video_id)
     
@@ -212,13 +217,14 @@ def process_video_ai(video_id):
     
     data = request.json or {}
     is_async = data.get('async', False)
-    batch_size = data.get('batch_size', 50)
+    batch_size = data.get('batch_size', 32)
+    force_reprocess = data.get('force_reprocess', False)
     
     if is_async:
         # 异步执行
         thread = threading.Thread(
             target=_process_ai_background,
-            args=(video_id, batch_size)
+            args=(video_id, batch_size, force_reprocess)
         )
         thread.start()
         
@@ -228,23 +234,43 @@ def process_video_ai(video_id):
             'video_id': video_id
         })
     else:
-        # 同步执行
-        result = _process_video_ai_sync(video_id, batch_size)
+        # 同步执行，加锁限制并发
+        with _ai_process_lock:
+            result = _process_video_ai_sync(video_id, batch_size, force_reprocess)
         return jsonify(result)
 
 
-def _process_video_ai_sync(video_id, batch_size=50):
-    """同步执行AI处理"""
+def _process_video_ai_sync(video_id, batch_size=50, force_reprocess=False):
+    """
+    同步执行AI处理（支持多实例并行推理）
+    
+    Args:
+        video_id: 视频ID
+        batch_size: 批处理大小
+        force_reprocess: 是否强制重新处理已处理的帧
+    """
+    import time as time_module
+    
     start_time = datetime.now()
+    ocr_total_time = 0.0
+    classify_total_time = 0.0
     
     try:
-        # 获取所有未处理的帧
-        frames = video_db.list_frames(video_id=video_id, ai_processed=False)
+        # 获取帧列表
+        if force_reprocess:
+            # 强制重新处理：获取所有帧
+            frames = video_db.list_frames(video_id=video_id, ai_processed=None, limit=100000)
+            print(f"🔧 force_reprocess=True，将重新处理所有 {len(frames)} 帧")
+        else:
+            # 正常模式：只处理未处理的帧
+            frames = video_db.list_frames(video_id=video_id, ai_processed=False, limit=100000)
         
         if not frames:
             return {
                 'success': True,
-                'message': '所有帧已处理完成',
+                'message': '所有帧已处理完成' if not force_reprocess else '没有帧需要处理',
+                'ocr_time_sec': 0.0,
+                'classify_time_sec': 0.0,
                 'processed_count': 0
             }
         
@@ -256,30 +282,46 @@ def _process_video_ai_sync(video_id, batch_size=50):
         for i in range(0, len(frames), batch_size):
             batch = frames[i:i+batch_size]
             
+            batch_image_paths = [f['image_path'] for f in batch if f.get('image_path') and os.path.exists(f['image_path'])]
+            
+            if not batch_image_paths:
+                continue
+            
+            # ============ OCR批量处理（多实例并行） ============
+            ocr_start = time_module.time()
+            ocr_results = video_ocr_service.batch_extract_parallel(batch_image_paths)
+            ocr_end = time_module.time()
+            ocr_batch_time = ocr_end - ocr_start
+            ocr_total_time += ocr_batch_time
+            
+            # ============ 分类批量处理（真正batch + 多GPU并行） ============
+            classify_start = time_module.time()
+            classification_results = video_classifier_service.batch_classify(batch_image_paths, use_parallel=True)
+            classify_end = time_module.time()
+            classify_batch_time = classify_end - classify_start
+            classify_total_time += classify_batch_time
+            
+            # 创建路径到结果的映射
+            path_to_ocr = {path: result for path, result in zip(batch_image_paths, ocr_results)}
+            path_to_classify = {path: result for path, result in zip(batch_image_paths, classification_results)}
+            
+            # 更新数据库
             for frame in batch:
-                # OCR提取
-                ocr_result = video_ocr_service.extract_text(
-                    frame['image_path'],
-                    frame['frame_idx']
-                )
+                img_path = frame.get('image_path')
+                if not img_path or img_path not in path_to_ocr:
+                    continue
                 
-                # 场景分类
-                classification_result = video_classifier_service.classify(
-                    frame['image_path'],
-                    frame['frame_idx']
-                )
+                ocr_result = path_to_ocr.get(img_path, {})
+                classification_result = path_to_classify.get(img_path, {})
                 
-                # 更新数据库
-                print(f"classification_result: {classification_result}")
                 video_db.update_frame_ai_results(
                     frame['id'],
                     ocr_results=ocr_result,
                     classification_results=classification_result
                 )
-                
                 processed_count += 1
             
-            print(f"   已处理 {processed_count}/{len(frames)} 帧")
+            print(f"   已处理 {processed_count}/{len(frames)} 帧 [OCR: {ocr_batch_time:.2f}s, 分类: {classify_batch_time:.2f}s]")
         
         # 记录日志
         duration = (datetime.now() - start_time).total_seconds()
@@ -287,7 +329,12 @@ def _process_video_ai_sync(video_id, batch_size=50):
             video_id=video_id,
             operation='ai_processing',
             status='success',
-            details={'processed_frames': processed_count},
+            details={
+                'processed_frames': processed_count,
+                'force_reprocess': force_reprocess,
+                'ocr_time_sec': round(ocr_total_time, 2),
+                'classify_time_sec': round(classify_total_time, 2)
+            },
             duration_sec=duration
         )
         
@@ -306,13 +353,16 @@ def _process_video_ai_sync(video_id, batch_size=50):
             except Exception as _e:
                 print(f"⚠️ 清理帧图片失败: {_e}")
         
-        print(f"✅ AI处理完成: {processed_count} 帧，用时 {duration:.2f}s")
+        print(f"✅ AI处理完成: {processed_count} 帧，总耗时 {duration:.2f}s")
+        print(f"   📊 OCR总耗时: {ocr_total_time:.2f}s, 分类总耗时: {classify_total_time:.2f}s")
         
         return {
             'success': True,
             'message': 'AI处理完成',
             'processed_count': processed_count,
-            'duration_sec': round(duration, 2)
+            'duration_sec': round(duration, 2),
+            'ocr_time_sec': round(ocr_total_time, 2),
+            'classify_time_sec': round(classify_total_time, 2)
         }
         
     except Exception as e:
@@ -335,9 +385,10 @@ def _process_video_ai_sync(video_id, batch_size=50):
         }
 
 
-def _process_ai_background(video_id, batch_size):
+def _process_ai_background(video_id, batch_size, force_reprocess=False):
     """后台执行AI处理"""
-    _process_video_ai_sync(video_id, batch_size)
+    with _ai_process_lock:
+        _process_video_ai_sync(video_id, batch_size, force_reprocess)
 
 
 @video_bp.route('/videos/<int:video_id>', methods=['DELETE'])

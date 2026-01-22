@@ -148,16 +148,19 @@ def test_extract_frames(video_id, force_reprocess=False):
 # ============================================================================
 # 测试4: AI处理帧
 # ============================================================================
-def test_process_frames(video_id):
+def test_process_frames(video_id, force_reprocess=False):
     """测试AI处理"""
     print_separator(f"测试4: AI处理帧 (ID={video_id})")
     
     data = {
-        "batch_size": 10,
-        "async": False  # 同步执行
+        "batch_size": 64,
+        "async": False,  # 同步执行
+        "force_reprocess": force_reprocess  # 是否强制重新处理
     }
     
     print(f"开始AI处理，批次大小: {data['batch_size']}")
+    if force_reprocess:
+        print(f"   🔧 force_reprocess=True，强制重新处理所有帧")
     
     try:
         response = requests.post(f"{BASE_URL}/videos/{video_id}/process-ai", json=data)
@@ -748,15 +751,20 @@ def run_all_tests():
     if video_id:
         # 3. 视频抽帧
         # 设置 force_reprocess=True 可以在debug时强制重新抽帧
-        if test_extract_frames(video_id, force_reprocess=False):
+        if test_extract_frames(video_id, 
+                            #    force_reprocess=True
+                               ):
             # exit()
             time.sleep(2)
             
             # 4. AI处理
-            test_process_frames(video_id)
+            # 设置 force_reprocess=True 可以在debug时强制重新处理
+            test_process_frames(video_id, 
+                                force_reprocess=True
+                                )
             time.sleep(2)
             
-            # exit()
+            exit()
             # 5. 查询视频的帧
             frames = test_get_frames_by_video(video_id)
             time.sleep(1)

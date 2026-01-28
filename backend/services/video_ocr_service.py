@@ -1,13 +1,20 @@
 """
 视频OCR服务
-调用 PaddleOCR (PP-OCRv5_server) 识别图片中的文字
+支持多种OCR后端：
+1. PaddleOCR (PP-OCRv5_server) - 传统OCR，速度快
+2. HunyuanOCR (基于Transformers的VLM) - 精度高但较慢
+
 支持多进程并行推理（绕过Python GIL限制）
 
 性能说明：
-- PaddleOCR 本身不支持真正的batch推理，每张图片单独处理
+- 两种OCR都不支持真正的batch推理，每张图片需单独处理
 - Python的GIL限制了多线程的真正并行
 - 解决方案：使用多进程（multiprocessing）实现真正并行
 - 每个进程独立加载OCR模型，在不同GPU上运行
+
+配置说明：
+- OCR_ENGINE_TYPE: 选择OCR后端 ("paddleocr" 或 "hunyuan")
+- 通过环境变量或config.py配置
 """
 import os
 import sys
@@ -20,6 +27,26 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 import multiprocessing as mp
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# ============ OCR 引擎类型检测 ============
+
+def _get_ocr_engine_type() -> str:
+    """获取配置的OCR引擎类型"""
+    from config import OCR_ENGINE_TYPE
+    return OCR_ENGINE_TYPE.lower()
+
+
+def is_hunyuan_ocr() -> bool:
+    """检查是否使用 HunyuanOCR"""
+    return _get_ocr_engine_type() == "hunyuan"
+
+
+def is_paddle_ocr() -> bool:
+    """检查是否使用 PaddleOCR"""
+    return _get_ocr_engine_type() == "paddleocr"
+
+
+# ============ PaddleOCR 相关代码 ============
 
 # 全局变量：OCR实例（进程内单例）
 _ocr_instance = None
@@ -151,9 +178,9 @@ def _get_or_create_process_pool(gpu_id: str, workers_per_gpu: int) -> ProcessPoo
         return _process_pools[gpu_id]
 
 
-def parallel_recognize_text(image_paths: List[str]) -> Dict[str, List[Dict]]:
+def parallel_recognize_text_paddle(image_paths: List[str]) -> Dict[str, List[Dict]]:
     """
-    多进程并行OCR识别（真正绕过GIL）
+    多进程并行 PaddleOCR 识别（真正绕过GIL）
     
     使用多进程池，每个GPU一个进程池，进程数由OCR_INSTANCES_PER_GPU配置
     
@@ -207,9 +234,35 @@ def parallel_recognize_text(image_paths: List[str]) -> Dict[str, List[Dict]]:
     return results
 
 
-def recognize_text(image_path):
+def parallel_recognize_text(image_paths: List[str]) -> Dict[str, List[Dict]]:
     """
-    识别单张图片中的文字
+    多进程并行OCR识别（自动选择后端）
+    
+    根据 OCR_ENGINE_TYPE 配置自动选择 PaddleOCR 或 HunyuanOCR
+    
+    Args:
+        image_paths: 图片路径列表
+    
+    Returns:
+        {image_path: recognized_items} 的字典
+    """
+    if not image_paths:
+        return {}
+    
+    if is_hunyuan_ocr():
+        # 使用 HunyuanOCR
+        from services.hunyuan_ocr_service import parallel_recognize_text_hunyuan
+        print(f"📝 使用 HunyuanOCR 处理 {len(image_paths)} 张图片...")
+        return parallel_recognize_text_hunyuan(image_paths)
+    else:
+        # 默认使用 PaddleOCR
+        print(f"📝 使用 PaddleOCR 处理 {len(image_paths)} 张图片...")
+        return parallel_recognize_text_paddle(image_paths)
+
+
+def recognize_text_paddle(image_path: str) -> List[Dict]:
+    """
+    使用 PaddleOCR 识别单张图片中的文字
     
     Args:
         image_path: 图片路径
@@ -227,6 +280,31 @@ def recognize_text(image_path):
     ocr = get_ocr(gpu_id)
     result = ocr.predict(image_path)
     return _parse_ocr_result(result)
+
+
+def recognize_text(image_path: str) -> List[Dict]:
+    """
+    识别单张图片中的文字（自动选择后端）
+    
+    根据 OCR_ENGINE_TYPE 配置自动选择 PaddleOCR 或 HunyuanOCR
+    
+    Args:
+        image_path: 图片路径
+    
+    Returns:
+        results: 识别结果列表
+    """
+    if not os.path.exists(image_path):
+        print(f"⚠️ OCR图片不存在: {image_path}")
+        return []
+    
+    if is_hunyuan_ocr():
+        # 使用 HunyuanOCR
+        from services.hunyuan_ocr_service import recognize_text_hunyuan
+        return recognize_text_hunyuan(image_path)
+    else:
+        # 默认使用 PaddleOCR
+        return recognize_text_paddle(image_path)
 
 
 class VideoOCRService:
@@ -445,6 +523,67 @@ class VideoOCRService:
 
 # 全局实例
 video_ocr_service = VideoOCRService()
+
+
+# ============ 工具函数 ============
+
+def get_ocr_engine_info() -> Dict:
+    """
+    获取当前OCR引擎信息
+    
+    Returns:
+        包含引擎类型和配置信息的字典
+    """
+    from config import OCR_ENGINE_TYPE, OCR_DEVICE_IDS, OCR_INSTANCES_PER_GPU
+    
+    info = {
+        'engine_type': OCR_ENGINE_TYPE,
+        'device_ids': OCR_DEVICE_IDS,
+        'instances_per_gpu': OCR_INSTANCES_PER_GPU,
+    }
+    
+    if is_hunyuan_ocr():
+        from config import (
+            HUNYUAN_OCR_MODEL_PATH,
+            HUNYUAN_OCR_DTYPE,
+            HUNYUAN_OCR_ATTN_IMPL,
+            HUNYUAN_OCR_MAX_NEW_TOKENS,
+        )
+        info.update({
+            'model_path': HUNYUAN_OCR_MODEL_PATH,
+            'dtype': HUNYUAN_OCR_DTYPE,
+            'attn_impl': HUNYUAN_OCR_ATTN_IMPL,
+            'max_new_tokens': HUNYUAN_OCR_MAX_NEW_TOKENS,
+        })
+    else:
+        from config import (
+            OCR_DET_MODEL_NAME,
+            OCR_REC_MODEL_NAME,
+            OCR_DET_MODEL_PATH,
+            OCR_REC_MODEL_PATH,
+        )
+        info.update({
+            'det_model': OCR_DET_MODEL_PATH or OCR_DET_MODEL_NAME,
+            'rec_model': OCR_REC_MODEL_PATH or OCR_REC_MODEL_NAME,
+        })
+    
+    return info
+
+
+def shutdown_ocr_pools():
+    """关闭所有OCR进程池"""
+    global _process_pools
+    
+    with _pools_lock:
+        for gpu_id, pool in _process_pools.items():
+            print(f"🔧 关闭 PaddleOCR GPU {gpu_id} 的进程池")
+            pool.shutdown(wait=True)
+        _process_pools.clear()
+    
+    # 如果使用 HunyuanOCR，也关闭其进程池
+    if is_hunyuan_ocr():
+        from services.hunyuan_ocr_service import shutdown_hunyuan_pools
+        shutdown_hunyuan_pools()
 
 
 if __name__ == '__main__':

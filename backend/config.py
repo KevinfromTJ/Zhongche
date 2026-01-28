@@ -55,11 +55,25 @@ CLASSIFIER_BATCH_SIZE = int(os.getenv("CLASSIFIER_BATCH_SIZE", "32"))  # 分类�
 OCR_DEVICE = os.getenv("OCR_DEVICE", f"gpu:{OCR_DEVICE_IDS[0]}")
 CLASSIFIER_DEVICE = os.getenv("CLASSIFIER_DEVICE", f"cuda:{CLASSIFIER_DEVICE_IDS[0]}")
 
-# OCR模型配置
+# OCR引擎类型配置
+# - "paddleocr": 使用 PaddleOCR (PP-OCRv5_server)，传统OCR，速度快
+# - "hunyuan": 使用 HunyuanOCR (基于Transformers的VLM)，精度高但较慢
+OCR_ENGINE_TYPE = os.getenv("OCR_ENGINE_TYPE", "hunyuan")
+
+# PaddleOCR 模型配置 (当 OCR_ENGINE_TYPE="paddleocr" 时生效)
 OCR_DET_MODEL_PATH = os.getenv("OCR_DET_MODEL_PATH", None)  # None表示使用默认模型名
 OCR_REC_MODEL_PATH = os.getenv("OCR_REC_MODEL_PATH", None)  # None表示使用默认模型名
 OCR_DET_MODEL_NAME = os.getenv("OCR_DET_MODEL_NAME", "PP-OCRv5_server_det")  # 检测模型名称
 OCR_REC_MODEL_NAME = os.getenv("OCR_REC_MODEL_NAME", "PP-OCRv5_server_rec")  # 识别模型名称
+
+# HunyuanOCR 模型配置 (当 OCR_ENGINE_TYPE="hunyuan" 时生效)
+HUNYUAN_OCR_MODEL_PATH = os.getenv("HUNYUAN_OCR_MODEL_PATH", "/data1/chenjuntao/Models_ckp/HunyuanOCR")
+HUNYUAN_OCR_DTYPE = os.getenv("HUNYUAN_OCR_DTYPE", "bfloat16")  # bfloat16, float16, float32
+HUNYUAN_OCR_ATTN_IMPL = os.getenv("HUNYUAN_OCR_ATTN_IMPL", "sdpa")  # sdpa, eager, flash_attention_2
+HUNYUAN_OCR_MAX_NEW_TOKENS = int(os.getenv("HUNYUAN_OCR_MAX_NEW_TOKENS", "64"))  # 生成最大token数
+# HUNYUAN_OCR_PROMPT = os.getenv("HUNYUAN_OCR_PROMPT", "提取图片中的文本，注意规范输出，不要有多余空格")
+HUNYUAN_OCR_PROMPT = os.getenv("HUNYUAN_OCR_PROMPT", "提取图片中的文本，一共有7项，按 \"XX: XXX\" \"XX: XXX-YYY\" \"XX: XXX\" \"YYYY-MM-DD HH:MM:SS\" \"XX: YXXX\" \"XXX: XXX\" \"XXX: XXX\" 格式输出，不要有多余空格")
+
 
 # 服务器配置
 HOST = '0.0.0.0'
